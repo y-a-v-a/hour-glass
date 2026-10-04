@@ -1,0 +1,47 @@
+name: HourGlass
+options:
+  bundleIdPrefix: nl.vincentbruijn
+  deploymentTarget:
+    watchOS: "10.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: HFFHH9CJYF
+packages:
+  HourGlassCore:
+    path: Packages/HourGlassCore
+targets:
+  HourGlass:
+    type: application
+    platform: watchOS
+    sources: [App]
+    dependencies:
+      - package: HourGlassCore
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: Hourglass
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        # A standalone watch app, with no iPhone app.
+        WKApplication: true
+        WKWatchOnly: true
+        # Lets a running hourglass keep time, and tap your wrist when it runs out, with the
+        # screen off. The sand timer is a mindfulness session.
+        WKBackgroundModes: [mindfulness]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: nl.vincentbruijn.HourGlass
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        INFOPLIST_KEY_CFBundleDisplayName: Hourglass
+schemes:
+  HourGlass:
+    build:
+      targets:
+        HourGlass: all
+    run:
+      config: Debug
