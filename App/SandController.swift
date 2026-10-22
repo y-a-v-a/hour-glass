@@ -67,6 +67,15 @@ final class SandController {
     private static let framesBeforeSlowing = 210
     private var lastDate: Date?
     private var frameDebt: Double = 0
+    /// Since the sand was last rendered: frames gone by, and grain moves made. And whether that
+    /// render drew anything that only lasts a frame (highlights on moving grains, streaks, glints)
+    /// and the light direction it used.
+    private var framesSinceRender = 0
+    private var movesSinceRender = 0
+    private var renderFades = false
+    private var renderedLight = -1
+    /// Sand at rest is still rendered this often, in frames, so it keeps twinkling.
+    private static let glintEvery = 6
     /// How long the last simulated frame took, in seconds.
     private var lastSimulationTime: Double = 0
     private var suspendedAt: Date?
@@ -129,7 +138,7 @@ final class SandController {
             lightY = forces.ay
         }
 
-        if needsWaking(world) { wake() }
+        if needsWaking(world) { stayAwake() }
         if quietFrames >= Self.framesBeforeSleep && image != nil {
             quietFrames += 1
             if quietFrames == Self.framesBeforeSlowing { setAsleep(true) }
@@ -149,15 +158,40 @@ final class SandController {
             quietFrames = moves == 0 ? quietFrames + 1 : 0
         }
 
-        renderer?.render(world, gravityX: lightX, gravityY: lightY, sparkle: palette.packedSparkle)
-        image = renderer?.makeImage()
+        movesSinceRender += moves
+        renderIfChanged(world)
         return image
+    }
+
+    /// Renders the sand, unless it would look just as it did. On a long hourglass most frames move
+    /// no grain at all, and a frame that isn't re-rendered costs SwiftUI next to nothing either.
+    private func renderIfChanged(_ world: SandWorld) {
+        guard let renderer else { return }
+        // Which way the light falls: the renderer only cares whether it's mostly vertical, and from
+        // which side.
+        let light = abs(lightY) >= abs(lightX) ? (lightY >= 0 ? 0 : 1) : (lightX >= 0 ? 2 : 3)
+        framesSinceRender += 1
+        guard image == nil || movesSinceRender > 0 || renderFades || light != renderedLight
+                || framesSinceRender >= Self.glintEvery else { return }
+        renderer.render(world, gravityX: lightX, gravityY: lightY, sparkle: palette.packedSparkle,
+                        stillFrames: framesSinceRender)
+        image = renderer.makeImage()
+        renderFades = movesSinceRender > 0 || renderer.drewStreaks || renderer.drewGlints
+        renderedLight = light
+        framesSinceRender = 0
+        movesSinceRender = 0
+    }
+
+    /// Makes sure the next frame is rendered afresh, for when the sand changed outside a frame.
+    private func renderNextFrame() {
+        renderedLight = -1
     }
 
     /// An image of the sand as it is, without moving it.
     private func still(_ world: SandWorld) -> CGImage? {
         renderer?.render(world, gravityX: lightX, gravityY: lightY, sparkle: palette.packedSparkle)
         image = renderer?.makeImage()
+        renderNextFrame()
         return image
     }
 
@@ -177,6 +211,11 @@ final class SandController {
 
     /// Something outside the simulation changed the sand: make sure it's simulated and redrawn.
     private func wake() {
+        stayAwake()
+        renderNextFrame()
+    }
+
+    private func stayAwake() {
         quietFrames = 0
         setAsleep(false)
     }
@@ -195,6 +234,8 @@ final class SandController {
         case .hourglass: world.addGateTokens(Float(rate / 60))
         }
         let fingerVelocity = applyFinger(world)
+        // Sand pushed aside by a finger has moved, whether or not it goes on moving by itself.
+        if fingerVelocity != nil { renderNextFrame() }
         var impact: Float = 0
         var moves = 0
         for _ in 0..<SandWorld.stepsPerFrame {
@@ -312,6 +353,7 @@ final class SandController {
         let (gx, gy) = abs(forces.ax) + abs(forces.ay) > 0.01 ? (forces.ax, forces.ay) : (lightX, lightY)
         pourClock += 1
         if deficit > 0 {
+            renderNextFrame()
             let intro = introUntil.map { date < $0 } ?? false
             let streams = intro ? 3 : 1
             let perStream = min(deficit / streams + 1, max(12, world.width / 5))
@@ -329,6 +371,7 @@ final class SandController {
             }
         } else if deficit < -world.width / 4 {
             world.drain(min(-deficit, world.width / 2), gravityX: gx, gravityY: gy)
+            renderNextFrame()
         }
     }
 
@@ -508,6 +551,7 @@ final class SandController {
         guard let counts = world.bulbCounts() else { return }
         renderer.render(world, gravityX: lightX, gravityY: lightY, sparkle: palette.packedSparkle)
         image = renderer.makeImage()
+        renderNextFrame()
         activity.dimmedImage = image
         let upper = flowsDownward ? counts.above : counts.below
         let lower = flowsDownward ? counts.below : counts.above

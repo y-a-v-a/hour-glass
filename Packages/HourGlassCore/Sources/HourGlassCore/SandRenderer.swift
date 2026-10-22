@@ -24,6 +24,10 @@ public final class SandRenderer {
     private let fast: UnsafeMutablePointer<Int32>
     /// Counts renders, so glints change from frame to frame.
     private var tick: UInt64 = 0xD15C_0BA11
+    /// What the last render drew that will look different on the next one, even if no grain
+    /// moves in between: streaks behind fast grains, and glints.
+    public private(set) var drewStreaks = false
+    public private(set) var drewGlints = false
     private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
     private lazy var pool = BufferPool(size: width * height * 4)
 
@@ -55,8 +59,12 @@ public final class SandRenderer {
     ///   - sparkle: Packed colour of a glint.
     ///   - brightness: Overall level, 1 for normal; lower for the always-on display.
     ///   - recentSteps: Grains that moved within this many steps count as moving.
+    ///   - stillFrames: How many frames this render stands for, as far as glints on resting sand
+    ///     go: when frames in which nothing moved weren't rendered, their share of glints comes now,
+    ///     so the sand twinkles as often as ever.
     public func render(_ world: SandWorld, gravityX: Float, gravityY: Float, sparkle: UInt32,
-                       brightness: Float = 1, recentSteps: Int = SandWorld.stepsPerFrame) {
+                       brightness: Float = 1, recentSteps: Int = SandWorld.stepsPerFrame,
+                       stillFrames: Int = 1) {
         precondition(world.width == width && world.height == height)
         let w = width, h = height
         let kind = world.kind, color = world.color, flags = world.grainFlags, moved = world.moved
@@ -73,6 +81,8 @@ public final class SandRenderer {
         tick &+= 1
         let tick = tick
         let glint = scale(sparkle, level)
+        let stillGlint = min(1, 0.0025 * Float(max(1, stillFrames)))
+        var glints = 0
         let recent = UInt8(max(1, min(recentSteps, 200)))
         let minSpeed: Float = 0.9
         let fast = fast
@@ -94,8 +104,11 @@ public final class SandRenderer {
                 let age = frame >= moved[i] ? frame - moved[i] : frame &+ (255 &- moved[i])
                 let movedNow = age < recent
                 if flags[i] & SandWorld.sparkleFlag != 0 {
-                    let chance: Float = movedNow ? 0.3 : 0.0025
-                    if Self.random(i, tick) < chance { return glint }
+                    let chance: Float = movedNow ? 0.3 : stillGlint
+                    if Self.random(i, tick) < chance {
+                        glints += 1
+                        return glint
+                    }
                 }
                 let f = factors[(movedNow ? Self.depthLevels : 0) + min(depth, Self.depthLevels - 1)]
                 return scale(color[i], f)
@@ -150,6 +163,8 @@ public final class SandRenderer {
                 }
             }
         }
+        drewStreaks = fastCount > 0
+        drewGlints = glints > 0
         drawTrails(world, fast: fast, count: fastCount, backwards: backwards, level: level)
     }
 
