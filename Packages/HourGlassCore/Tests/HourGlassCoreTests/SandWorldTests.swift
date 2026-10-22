@@ -141,6 +141,21 @@ final class SandWorldTests: XCTestCase {
         }
     }
 
+    func testANarrowerGridHoldsTheSameHourglass() {
+        for (w, h, maxHalf) in [(208, 195, Float(43.5)), (138, 126, 29.6), (104, 97, 21.8), (93, 111, 40)] {
+            let full = Container.hourglass(width: w, height: h, capRoom: 10, maxHalfWidth: maxHalf)
+            let narrowWidth = Container.hourglassWidth(fitting: w, height: h, capRoom: 10, maxHalfWidth: maxHalf)
+            let narrow = Container.hourglass(width: narrowWidth, height: h, capRoom: 10, maxHalfWidth: maxHalf)
+            XCTAssertLessThan(narrow.width, w * 3 / 4, "\(w)x\(h)")
+            XCTAssertEqual(narrow.glass!.bulbHalfWidth, full.glass!.bulbHalfWidth, "\(w)x\(h)")
+            XCTAssertEqual(narrow.interiorCount, full.interiorCount, "\(w)x\(h)")
+            XCTAssertEqual(narrow.bulbCapacity(), full.bulbCapacity(), "\(w)x\(h)")
+            // Still symmetric under a half turn, so turning it over only has to rotate the sand.
+            let n = narrow.width * h
+            XCTAssertTrue((0..<n).allSatisfy { narrow.walls[$0] == narrow.walls[n - 1 - $0] }, "\(w)x\(h)")
+        }
+    }
+
     func testRotatingTheHourglassKeepsWallsInPlace() {
         let container = Container.hourglass(width: 70, height: 84)
         let world = SandWorld(width: 70, height: 84)

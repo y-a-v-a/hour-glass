@@ -247,17 +247,13 @@ final class SandController {
 
     private func configure(_ layout: SandLayout, date: Date) {
         self.layout = layout
-        let size = layout.viewSize, cellSize = layout.cellSize
         let w = layout.columns, h = layout.rows
         let container: Container
         switch mode {
         case .sandbox:
             container = .screen(width: w, height: h, cornerRadius: Float(w) * 0.21)
         case .hourglass:
-            let capRoom = Float((SandDrawing.Frame.capHeight + 1) / cellSize)
-            let buttonRoom: CGFloat = 52
-            let maxHalf = (size.width / 2 - buttonRoom - SandDrawing.Frame.reach) / cellSize
-            container = .hourglass(width: w, height: h, capRoom: capRoom, maxHalfWidth: Float(maxHalf))
+            container = .hourglass(width: w, height: h, capRoom: layout.capRoom, maxHalfWidth: layout.maxHalfWidth)
         }
         let world = SandWorld(width: w, height: h, seed: UInt64.random(in: 1...UInt64.max))
         world.apply(container)

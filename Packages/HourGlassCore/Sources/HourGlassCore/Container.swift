@@ -71,6 +71,21 @@ public struct Container {
                          glass: geometry)
     }
 
+    /// How narrow a grid `width` cells wide can be made and still hold exactly the same hourglass
+    /// (see `hourglass(width:height:capRoom:maxHalfWidth:)`): as wide as the bulbs and a little
+    /// more. Everything beyond is wall that never changes, and needn't be simulated or drawn.
+    public static func hourglassWidth(fitting width: Int, height: Int, capRoom: Float? = nil,
+                                      maxHalfWidth: Float) -> Int {
+        let geometry = HourglassGeometry(width: width, height: height,
+                                         capRoom: capRoom ?? Float(height) * 0.13,
+                                         maxHalfWidth: maxHalfWidth)
+        // The bulbs stay two cells inside the grid's middle either side, and the width keeps its
+        // parity: the glass is centred on the grid, so cells line up with it the same way.
+        var narrow = Int((2 * geometry.bulbHalfWidth).rounded(.up)) + 4
+        if (width - narrow) % 2 != 0 { narrow += 1 }
+        return min(width, narrow)
+    }
+
     /// Open cells strictly on one side of the neck: the capacity of one bulb.
     public func bulbCapacity() -> Int {
         guard let glass else { return interiorCount }

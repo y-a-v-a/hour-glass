@@ -31,6 +31,13 @@ struct SandLayout: Equatable {
             : CGRect(x: 0, y: top, width: size.width, height: size.height - top - 3)
         columns = max(0, Int(area.width / cellSize))
         rows = max(0, Int(area.height / cellSize))
+        origin = .zero
+        if mode == .hourglass && columns >= 3 && rows >= 3 {
+            // Only as wide as the glass: the wall either side never changes, and narrower is less to
+            // simulate and draw every frame.
+            columns = Container.hourglassWidth(fitting: columns, height: rows, capRoom: capRoom,
+                                               maxHalfWidth: maxHalfWidth)
+        }
         origin = CGPoint(x: area.minX + (area.width - CGFloat(columns) * cellSize) / 2,
                          y: area.minY + (area.height - CGFloat(rows) * cellSize) / 2)
     }
@@ -38,6 +45,16 @@ struct SandLayout: Equatable {
     /// Where the hourglass's area starts, below the settings button and the clock.
     static func hourglassTop(for size: CGSize) -> CGFloat {
         max(44, size.height * 0.2)
+    }
+
+    /// Hourglass only: cells to leave above and below the glass for its caps.
+    var capRoom: Float { Float((SandDrawing.Frame.capHeight + 1) / cellSize) }
+
+    /// Hourglass only: the widest the bulbs may be, in cells from the middle, keeping clear of the
+    /// button in the bottom corner.
+    var maxHalfWidth: Float {
+        let buttonRoom: CGFloat = 52
+        return Float((viewSize.width / 2 - buttonRoom - SandDrawing.Frame.reach) / cellSize)
     }
 
     /// Big enough to hold some sand.
