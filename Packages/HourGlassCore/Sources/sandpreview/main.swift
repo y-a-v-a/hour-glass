@@ -527,9 +527,10 @@ func bench() {
             scene.run(60)
             return scene
         }) { scene, _ in
-            // All the sand through in 60 s.
+            // All the sand through in 60 s, and the time left counted every frame, as the app does.
             scene.world.addGateTokens(Float(scene.world.grainCount) / 60 / 60)
             scene.run(1)
+            _ = scene.world.bulbCounts()
         },
     ]
     let repeats = options.repeats

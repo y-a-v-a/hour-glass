@@ -991,8 +991,20 @@ public final class SandWorld {
     public func grainCount(inRows rows: Range<Int>) -> Int {
         let lo = max(0, rows.lowerBound), hi = min(height, rows.upperBound)
         guard lo < hi else { return 0 }
+        // A running hourglass counts its bulbs every frame. Grains are the only cells with their
+        // lowest bit set, so eight cells' worth can be counted at once.
+        let raw = UnsafeRawPointer(kind)
+        var i = lo * width
+        let end = hi * width
         var count = 0
-        for i in (lo * width)..<(hi * width) where kind[i] == Self.grain { count += 1 }
+        while i + 8 <= end {
+            count += (raw.loadUnaligned(fromByteOffset: i, as: UInt64.self) & 0x0101_0101_0101_0101).nonzeroBitCount
+            i += 8
+        }
+        while i < end {
+            if kind[i] == Self.grain { count += 1 }
+            i += 1
+        }
         return count
     }
 

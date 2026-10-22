@@ -242,6 +242,23 @@ final class SandWorldTests: XCTestCase {
         }
     }
 
+    func testCountingGrainsInRows() {
+        let world = SandWorld(width: 13, height: 11, seed: 3)
+        world.apply(.screen(width: 13, height: 11, cornerRadius: 0))
+        world.fill(70) { _, _ in (0xFFFF_FFFF, 0) }
+        func slow(_ rows: Range<Int>) -> Int {
+            let lo = max(0, rows.lowerBound), hi = min(11, rows.upperBound)
+            guard lo < hi else { return 0 }
+            return (lo * 13..<hi * 13).filter { world.kind[$0] == SandWorld.grain }.count
+        }
+        for lo in -1...11 {
+            for hi in lo...12 {
+                XCTAssertEqual(world.grainCount(inRows: lo..<hi), slow(lo..<hi), "\(lo)..<\(hi)")
+            }
+        }
+        XCTAssertEqual(world.grainCount(inRows: 0..<11), 70)
+    }
+
     func testCatchingUpMovesSandBetweenBulbsWithoutLosingAny() {
         let container = Container.hourglass(width: 70, height: 84)
         let world = SandWorld(width: 70, height: 84)
