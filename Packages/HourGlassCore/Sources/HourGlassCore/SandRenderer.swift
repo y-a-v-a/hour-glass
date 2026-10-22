@@ -25,6 +25,7 @@ public final class SandRenderer {
     /// Counts renders, so glints change from frame to frame.
     private var tick: UInt64 = 0xD15C_0BA11
     private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+    private lazy var pool = BufferPool(size: width * height * 4)
 
     public init(width: Int, height: Int) {
         self.width = width
@@ -213,13 +214,60 @@ public final class SandRenderer {
     }
 
     /// A snapshot of the pixels. It owns a copy, so the next render can't tear it.
+    ///
+    /// The copy goes into memory from a small pool, which each image gives back once it's done
+    /// with (when Core Animation lets go of it, on whichever thread), so a frame doesn't cost a
+    /// fresh allocation of a few hundred kilobytes, zeroed page by page.
     public func makeImage() -> CGImage? {
-        let data = Data(bytes: pixels, count: width * height * 4)
-        guard let provider = CGDataProvider(data: data as CFData) else { return nil }
+        let size = width * height * 4
+        let buffer = pool.take()
+        buffer.copyMemory(from: pixels, byteCount: size)
+        let info = Unmanaged.passRetained(pool).toOpaque()
+        guard let provider = CGDataProvider(dataInfo: info, data: buffer, size: size, releaseData: { info, data, _ in
+            let pool = Unmanaged<BufferPool>.fromOpaque(info!).takeRetainedValue()
+            pool.give(UnsafeMutableRawPointer(mutating: data))
+        }) else {
+            Unmanaged<BufferPool>.fromOpaque(info).release()
+            pool.give(buffer)
+            return nil
+        }
         return CGImage(
             width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
             bytesPerRow: width * 4, space: colorSpace,
             bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
             provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+    }
+}
+
+/// Image memory to be used again. Shared between the renderer and the images it has made, so it
+/// lasts until the last of them is gone.
+private final class BufferPool: @unchecked Sendable {
+    private let size: Int
+    private var free: [UnsafeMutableRawPointer] = []
+    private let lock = NSLock()
+    /// More than this many spare buffers are released: a frame or two in flight is the norm.
+    private static let keep = 3
+
+    init(size: Int) {
+        self.size = size
+    }
+
+    deinit {
+        for buffer in free { buffer.deallocate() }
+    }
+
+    func take() -> UnsafeMutableRawPointer {
+        lock.lock()
+        let buffer = free.popLast()
+        lock.unlock()
+        return buffer ?? .allocate(byteCount: size, alignment: 16)
+    }
+
+    func give(_ buffer: UnsafeMutableRawPointer) {
+        lock.lock()
+        let kept = free.count < Self.keep
+        if kept { free.append(buffer) }
+        lock.unlock()
+        if !kept { buffer.deallocate() }
     }
 }
