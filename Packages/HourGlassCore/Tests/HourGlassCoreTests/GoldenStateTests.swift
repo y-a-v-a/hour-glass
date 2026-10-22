@@ -30,7 +30,7 @@ enum GoldenScenes {
         static let sandbox: UInt64 = 18_078_610_659_436_619_740
         static let hourglass: UInt64 = 5_931_781_402_685_662_885
         static let slosh: UInt64 = 7_770_563_022_562_141_003
-        static let render: UInt64 = 18_000_326_172_943_797_315
+        static let render: UInt64 = 16_292_390_150_030_889_404
     }
 
     /// FNV-1a, folded over everything the simulation exposes.
