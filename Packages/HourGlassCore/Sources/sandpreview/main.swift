@@ -501,6 +501,14 @@ func bench() {
         Case(name: "held", frames: 600, setup: settled) { scene, n in
             scene.run(1, degrees: 4 * sinf(Float(n) * 0.05), strength: 0.8)
         },
+        // The same with the watch on its side: gravity across the screen.
+        Case(name: "sideways", frames: 600, setup: { grain in
+            let scene = settled(grain)
+            scene.run(200, degrees: 90, strength: 0.8)
+            return scene
+        }) { scene, n in
+            scene.run(1, degrees: 90 + 4 * sinf(Float(n) * 0.05), strength: 0.8)
+        },
         // The opening pour.
         Case(name: "pour", frames: 150, setup: { Scene(shape: .screen, palette: .sahara, grain: $0) }) { scene, _ in
             scene.run(1, pour: fillFraction(scene, 0.4) / 150)

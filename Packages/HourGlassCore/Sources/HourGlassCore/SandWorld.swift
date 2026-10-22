@@ -310,9 +310,35 @@ public final class SandWorld {
                 for c in 1..<(w - 1) {
                     let x = ax >= 0 ? w - 1 - c : c
                     guard occupied[x] != 0 else { continue }
-                    let forward = (c + parity) & 1 == 0
-                    for r in 1..<(h - 1) {
-                        visit((forward ? r : h - 1 - r) * w + x)
+                    // Eight cells down the column at a time where possible, as along rows. A column
+                    // isn't contiguous, so checking a block costs more than along a row: where it
+                    // can't be dealt with whole, its cells are visited in turn before the next try.
+                    if (c + parity) & 1 == 0 {
+                        var r = 1
+                        while r < h - 1 {
+                            if r + 8 <= h - 1 {
+                                if !settle(column: x, from: r) {
+                                    for k in 0..<8 { visit((r + k) * w + x) }
+                                }
+                                r += 8
+                            } else {
+                                visit(r * w + x)
+                                r += 1
+                            }
+                        }
+                    } else {
+                        var r = h - 2
+                        while r >= 1 {
+                            if r - 7 >= 1 {
+                                if !settle(column: x, from: r - 7) {
+                                    for k in 0..<8 { visit((r - k) * w + x) }
+                                }
+                                r -= 8
+                            } else {
+                                visit(r * w + x)
+                                r -= 1
+                            }
+                        }
                     }
                 }
             }
@@ -359,6 +385,39 @@ public final class SandWorld {
                 velocityY[b + k] = 0
             }
             UnsafeMutableRawPointer(stamp).storeBytes(of: now, toByteOffset: b, as: UInt64.self)
+            return true
+        }
+
+        /// The same for the eight cells of column `x` from row `y`: no sand, or eight buried grains at
+        /// rest. A column isn't contiguous in memory, so each row of the block and the rows above and
+        /// below are read as a word of three cells (and one more): ten reads instead of three per cell.
+        @inline(__always)
+        private func settle(column x: Int, from y: Int) -> Bool {
+            let raw = UnsafeRawPointer(kind)
+            let w = width
+            var empty: UInt32 = 0
+            var grains = 0
+            for k in 0..<8 {
+                let word = raw.loadUnaligned(fromByteOffset: (y + k) * w + x - 1, as: UInt32.self)
+                empty |= Self.emptyBits(word)
+                if (word >> 8) & 0xFF == UInt32(SandWorld.grain) { grains += 1 }
+            }
+            if grains == 0 { return true }
+            guard grains == 8, empty == 0 else { return false }
+            empty = Self.emptyBits(raw.loadUnaligned(fromByteOffset: (y - 1) * w + x - 1, as: UInt32.self))
+                | Self.emptyBits(raw.loadUnaligned(fromByteOffset: (y + 8) * w + x - 1, as: UInt32.self))
+            guard empty == 0 else { return false }
+            // None of them in flight, nor already done this step.
+            for k in 0..<8 {
+                let i = (y + k) * w + x
+                if moved[i] == frame || moved[i] == previous || stamp[i] == frame { return false }
+            }
+            for k in 0..<8 {
+                let i = (y + k) * w + x
+                velocityX[i] = 0
+                velocityY[i] = 0
+                stamp[i] = frame
+            }
             return true
         }
 
