@@ -91,6 +91,9 @@ public final class SandWorld {
     private let stamp: UnsafeMutablePointer<UInt8>
     /// 1 for the metered cells of an hourglass neck.
     private let gate: UnsafeMutablePointer<UInt8>
+    /// Scratch for each step: which rows or columns hold sand (see `Stepper.markOccupied`).
+    private let occupied: UnsafeMutablePointer<UInt8>
+    private let columnBits: UnsafeMutablePointer<UInt64>
 
     public private(set) var grainCount = 0
     /// The current step number, wrapping 1...255.
@@ -114,7 +117,9 @@ public final class SandWorld {
         self.width = width
         self.height = height
         let n = width * height
-        kind = .allocate(capacity: n)
+        // Padded with wall, so a neighbourhood can be read a word at a time even at the last cell.
+        kind = .allocate(capacity: n + Self.padding)
+        (kind + n).initialize(repeating: Self.wall, count: Self.padding)
         color = .allocate(capacity: n)
         grainFlags = .allocate(capacity: n)
         moved = .allocate(capacity: n)
@@ -122,6 +127,8 @@ public final class SandWorld {
         velocityY = .allocate(capacity: n)
         stamp = .allocate(capacity: n)
         gate = .allocate(capacity: n)
+        occupied = .allocate(capacity: max(width, height))
+        columnBits = .allocate(capacity: (width + 7) / 8)
         rng = FastRandom(seed: seed)
         reset(walls: nil, neck: nil)
     }
@@ -135,7 +142,11 @@ public final class SandWorld {
         velocityY.deallocate()
         stamp.deallocate()
         gate.deallocate()
+        occupied.deallocate()
+        columnBits.deallocate()
     }
+
+    private static let padding = 8
 
     public var cellCount: Int { width * height }
 
@@ -215,6 +226,8 @@ public final class SandWorld {
         let velocityY: UnsafeMutablePointer<Float>
         let stamp: UnsafeMutablePointer<UInt8>
         let gate: UnsafeMutablePointer<UInt8>
+        let occupied: UnsafeMutablePointer<UInt8>
+        let columnBits: UnsafeMutablePointer<UInt64>
         let width: Int
         let height: Int
         let p: Parameters
@@ -238,6 +251,8 @@ public final class SandWorld {
             velocityY = world.velocityY
             stamp = world.stamp
             gate = world.gate
+            occupied = world.occupied
+            columnBits = world.columnBits
             width = world.width
             height = world.height
             p = world.parameters
@@ -261,28 +276,147 @@ public final class SandWorld {
             // from line to line and step to step: whichever neighbour is visited first gets first
             // go at a gap, and a fixed order would steer every rising hole the same way.
             if abs(ay) >= abs(ax) {
+                markOccupied(rows: true)
                 for r in 1..<(h - 1) {
-                    let row = (ay >= 0 ? h - 1 - r : r) * w
-                    let forward = (r + parity) & 1 == 0
-                    for c in 1..<(w - 1) {
-                        let i = row + (forward ? c : w - 1 - c)
-                        if kind[i] == SandWorld.grain && stamp[i] != frame {
-                            update(i)
+                    let y = ay >= 0 ? h - 1 - r : r
+                    guard occupied[y] != 0 else { continue }
+                    let row = y * w
+                    // Eight cells at a time where a whole block can be dealt with at once, one by
+                    // one where it can't.
+                    if (r + parity) & 1 == 0 {
+                        var c = 1
+                        while c < w - 1 {
+                            if c + 8 <= w - 1 && settle(block: row + c) {
+                                c += 8
+                                continue
+                            }
+                            visit(row + c)
+                            c += 1
+                        }
+                    } else {
+                        var c = w - 2
+                        while c >= 1 {
+                            if c - 7 >= 1 && settle(block: row + c - 7) {
+                                c -= 8
+                                continue
+                            }
+                            visit(row + c)
+                            c -= 1
                         }
                     }
                 }
             } else {
+                markOccupied(rows: false)
                 for c in 1..<(w - 1) {
                     let x = ax >= 0 ? w - 1 - c : c
+                    guard occupied[x] != 0 else { continue }
                     let forward = (c + parity) & 1 == 0
                     for r in 1..<(h - 1) {
-                        let i = (forward ? r : h - 1 - r) * w + x
-                        if kind[i] == SandWorld.grain && stamp[i] != frame {
-                            update(i)
-                        }
+                        visit((forward ? r : h - 1 - r) * w + x)
                     }
                 }
             }
+        }
+
+        @inline(__always)
+        private mutating func visit(_ i: Int) {
+            if kind[i] == SandWorld.grain && stamp[i] != frame {
+                update(i)
+            }
+        }
+
+        /// Deals with the eight cells from `b` along the row in one go, if they need nothing or
+        /// the same thing: no sand at all, or eight grains at rest that are buried, which `update`
+        /// would just hold still. Returns `false` to have them visited one by one instead.
+        ///
+        /// Holding a buried grain still changes no cell, so what's checked here at the start holds
+        /// for all eight, and the outcome is exactly that of visiting them in turn.
+        @inline(__always)
+        private func settle(block b: Int) -> Bool {
+            let raw = UnsafeRawPointer(kind)
+            let cells = raw.loadUnaligned(fromByteOffset: b, as: UInt64.self)
+            let ones: UInt64 = 0x0101_0101_0101_0101
+            if cells & ones == 0 { return true }
+            guard cells == ones, kind[b - 1] != SandWorld.empty, kind[b + 8] != SandWorld.empty else {
+                return false
+            }
+            // Everything around is taken: the ten cells above and below, read as two overlapping
+            // words each.
+            let w = width
+            let around = Self.zeroBytes(raw.loadUnaligned(fromByteOffset: b - w - 1, as: UInt64.self))
+                | Self.zeroBytes(raw.loadUnaligned(fromByteOffset: b - w + 1, as: UInt64.self))
+                | Self.zeroBytes(raw.loadUnaligned(fromByteOffset: b + w - 1, as: UInt64.self))
+                | Self.zeroBytes(raw.loadUnaligned(fromByteOffset: b + w + 1, as: UInt64.self))
+            guard around == 0 else { return false }
+            // None of them in flight, nor already done this step.
+            let movedBytes = UnsafeRawPointer(moved).loadUnaligned(fromByteOffset: b, as: UInt64.self)
+            let stampBytes = UnsafeRawPointer(stamp).loadUnaligned(fromByteOffset: b, as: UInt64.self)
+            let now = ones &* UInt64(frame), before = ones &* UInt64(previous)
+            guard Self.zeroBytes(movedBytes ^ now) | Self.zeroBytes(movedBytes ^ before)
+                    | Self.zeroBytes(stampBytes ^ now) == 0 else { return false }
+            for k in 0..<8 {
+                velocityX[b + k] = 0
+                velocityY[b + k] = 0
+            }
+            UnsafeMutableRawPointer(stamp).storeBytes(of: now, toByteOffset: b, as: UInt64.self)
+            return true
+        }
+
+        /// Non-zero if any byte of `v` is zero.
+        @inline(__always)
+        private static func zeroBytes(_ v: UInt64) -> UInt64 {
+            (v &- 0x0101_0101_0101_0101) & ~v & 0x8080_8080_8080_8080
+        }
+
+        /// Notes which rows (or columns) hold any sand as the step starts, so the empty ones can
+        /// be skipped. That's exact: a grain that moves into an empty line during the step has
+        /// already had its turn. Reads the grid a word at a time; empty cells and walls have no
+        /// grain bit.
+        private func markOccupied(rows: Bool) {
+            let raw = UnsafeRawPointer(kind)
+            let w = width, h = height
+            let words = (w + 7) / 8
+            let grainBits: UInt64 = 0x0101_0101_0101_0101
+            if rows {
+                for y in 1..<(h - 1) {
+                    // The last word runs on into the next row, which can only keep a row in.
+                    var any: UInt64 = 0
+                    for k in 0..<words {
+                        any |= raw.loadUnaligned(fromByteOffset: y * w + 8 * k, as: UInt64.self)
+                    }
+                    occupied[y] = any & grainBits != 0 ? 1 : 0
+                }
+            } else {
+                // OR the rows together: byte x % 8 of word x / 8 then stands for column x.
+                columnBits.update(repeating: 0, count: words)
+                for y in 1..<(h - 1) {
+                    for k in 0..<words {
+                        columnBits[k] |= raw.loadUnaligned(fromByteOffset: y * w + 8 * k, as: UInt64.self)
+                    }
+                }
+                for x in 1..<(w - 1) {
+                    occupied[x] = UInt8(truncatingIfNeeded: columnBits[x / 8] >> UInt64(8 * (x % 8))) & 1
+                }
+            }
+        }
+
+        /// Whether all eight neighbours of `i` are taken, by sand or wall. Reads each row of three
+        /// as one little-endian word, in which an empty cell is a zero byte.
+        @inline(__always)
+        private func surrounded(_ i: Int) -> Bool {
+            let raw = UnsafeRawPointer(kind)
+            let above = raw.loadUnaligned(fromByteOffset: i - width - 1, as: UInt32.self)
+            let level = raw.loadUnaligned(fromByteOffset: i - 1, as: UInt32.self)
+            let below = raw.loadUnaligned(fromByteOffset: i + width - 1, as: UInt32.self)
+            return Self.emptyBits(above) | Self.emptyBits(level) | Self.emptyBits(below) == 0
+        }
+
+        /// Non-zero if any of the low three bytes of `v` is zero (the classic zero-byte test, with
+        /// the fourth byte forced on).
+        @inline(__always)
+        private static func emptyBits(_ v: UInt32) -> UInt32 {
+            let x = v | 0xFF00_0000
+            return (x &- 0x0101_0101) & ~x & 0x8080_8080
         }
 
         @inline(__always)
@@ -295,11 +429,7 @@ public final class SandWorld {
             // Most of a pile is buried: a grain at rest with all eight neighbours taken can't go
             // anywhere this step, so skip the work. (A grain still in flight goes the long way, so
             // its impact can splash the grains it hits.)
-            if !inFlight
-                && kind[start - 1] != SandWorld.empty && kind[start + 1] != SandWorld.empty
-                && kind[start - w] != SandWorld.empty && kind[start + w] != SandWorld.empty
-                && kind[start - w - 1] != SandWorld.empty && kind[start - w + 1] != SandWorld.empty
-                && kind[start + w - 1] != SandWorld.empty && kind[start + w + 1] != SandWorld.empty {
+            if !inFlight && surrounded(start) {
                 velocityX[start] = 0
                 velocityY[start] = 0
                 stamp[start] = frame
