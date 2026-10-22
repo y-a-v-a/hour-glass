@@ -202,6 +202,7 @@ final class SandController {
     }
 
     private func setAsleep(_ asleep: Bool) {
+        motion.isIdle = asleep
         guard activity.isAsleep != asleep else { return }
         // Not in the middle of drawing a frame: let the views catch up afterwards.
         Task { @MainActor in self.activity.isAsleep = asleep }

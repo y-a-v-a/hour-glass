@@ -19,9 +19,21 @@ final class MotionReader {
     /// simulator shows the sand moving.
     let demo = ProcessInfo.processInfo.arguments.contains("-demo")
 
+    /// Readings a second while the sand is moving, and while it sleeps and is only checked now and
+    /// then for the wrist moving.
+    private static let awakeRate = 60.0, asleepRate = 10.0
+
+    /// While the sand sleeps the sensor needn't run at full rate.
+    var isIdle = false {
+        didSet {
+            guard isIdle != oldValue else { return }
+            manager.deviceMotionUpdateInterval = 1 / (isIdle ? Self.asleepRate : Self.awakeRate)
+        }
+    }
+
     func start() {
         guard isAvailable, !manager.isDeviceMotionActive else { return }
-        manager.deviceMotionUpdateInterval = 1.0 / 60
+        manager.deviceMotionUpdateInterval = 1 / (isIdle ? Self.asleepRate : Self.awakeRate)
         manager.startDeviceMotionUpdates()
         demoStart = Date()
     }
