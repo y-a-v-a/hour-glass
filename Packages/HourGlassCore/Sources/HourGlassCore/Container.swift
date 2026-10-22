@@ -84,7 +84,7 @@ public struct Container {
 }
 
 /// The silhouette of the hourglass, in cell units with y pointing down.
-public struct HourglassGeometry: Sendable {
+public struct HourglassGeometry: Sendable, Equatable {
     public let centerX: Float
     /// The middle of the neck.
     public let centerY: Float

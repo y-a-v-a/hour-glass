@@ -1,7 +1,9 @@
 import HourGlassCore
 import SwiftUI
 
-/// Draws a frame: the sand, and for the hourglass its glass, caps and posts.
+/// What's drawn around the sand: for the hourglass its glass, caps and posts, for the sandbox a
+/// sheen on the screen. None of it changes from frame to frame, so it's drawn by views of its own
+/// that SwiftUI redraws only when the layout changes, and the sand is just an image between them.
 @MainActor
 enum SandDrawing {
     /// Hourglass frame sizes, in points so they look the same at every grain size.
@@ -14,43 +16,26 @@ enum SandDrawing {
         static var reach: CGFloat { capOverhang + postGap }
     }
 
-    static func draw(in ctx: inout GraphicsContext, controller: SandController) {
-        guard let image = controller.image, let world = controller.world else { return }
-        let cell = controller.cellSize
-        let origin = controller.origin
-        let rect = CGRect(x: origin.x, y: origin.y,
-                          width: CGFloat(world.width) * cell, height: CGFloat(world.height) * cell)
-        let glass = controller.container?.glass
-
-        // Work in cell units from here on, like the simulation.
-        var cells = ctx
-        cells.translateBy(x: origin.x, y: origin.y)
-        cells.scaleBy(x: cell, y: cell)
-        let point = 1 / cell
-
-        if let glass { drawGlassBack(&cells, glass, point: point) }
-        // One pixel per grain, scaled up without smoothing so every grain stays crisp.
-        ctx.draw(Image(decorative: image, scale: 1).interpolation(.none), in: rect)
-        if let glass {
-            drawGlassFront(&cells, glass, point: point)
-            drawFrame(&cells, glass, point: point)
-        } else {
-            drawSheen(&ctx, rect)
-        }
-    }
-
     /// Where the hourglass's bottom cap sits in the view, for the countdown engraved on it.
-    static func bottomCap(of glass: HourglassGeometry, controller: SandController) -> CGRect {
-        let cell = controller.cellSize, origin = controller.origin
+    static func bottomCap(of glass: HourglassGeometry, layout: SandLayout) -> CGRect {
+        let cell = layout.cellSize, origin = layout.origin
         let width = (CGFloat(glass.bulbHalfWidth) * cell + Frame.reach) * 2
         return CGRect(x: origin.x + CGFloat(glass.centerX) * cell - width / 2,
                       y: origin.y + CGFloat(glass.bottom) * cell,
                       width: width, height: Frame.capHeight)
     }
 
+    /// `ctx` working in cell units, like the simulation, and the size of a point in them.
+    static func cells(_ ctx: GraphicsContext, _ layout: SandLayout) -> (GraphicsContext, CGFloat) {
+        var cells = ctx
+        cells.translateBy(x: layout.origin.x, y: layout.origin.y)
+        cells.scaleBy(x: layout.cellSize, y: layout.cellSize)
+        return (cells, 1 / layout.cellSize)
+    }
+
     // MARK: - Glass
 
-    private static func drawGlassBack(_ ctx: inout GraphicsContext, _ glass: HourglassGeometry, point: CGFloat) {
+    fileprivate static func drawGlassBack(_ ctx: inout GraphicsContext, _ glass: HourglassGeometry, point: CGFloat) {
         let outline = Path(glass.outline(inset: -0.6))
         ctx.fill(outline, with: .linearGradient(
             Gradient(colors: [.white.opacity(0.07), .white.opacity(0.03), .white.opacity(0.06)]),
@@ -58,7 +43,7 @@ enum SandDrawing {
             endPoint: CGPoint(x: CGFloat(glass.centerX + glass.bulbHalfWidth), y: 0)))
     }
 
-    private static func drawGlassFront(_ ctx: inout GraphicsContext, _ glass: HourglassGeometry, point: CGFloat) {
+    fileprivate static func drawGlassFront(_ ctx: inout GraphicsContext, _ glass: HourglassGeometry, point: CGFloat) {
         let outline = Path(glass.outline(inset: -0.6))
         ctx.stroke(outline, with: .color(.white.opacity(0.42)), lineWidth: 1.1 * point)
 
@@ -83,7 +68,7 @@ enum SandDrawing {
 
     // MARK: - Wooden frame
 
-    private static func drawFrame(_ ctx: inout GraphicsContext, _ glass: HourglassGeometry, point: CGFloat) {
+    fileprivate static func drawFrame(_ ctx: inout GraphicsContext, _ glass: HourglassGeometry, point: CGFloat) {
         let cx = CGFloat(glass.centerX)
         let half = CGFloat(glass.bulbHalfWidth) + Frame.reach * point
         let capHeight = Frame.capHeight * point
@@ -137,7 +122,7 @@ enum SandDrawing {
     // MARK: - Sandbox
 
     /// A soft reflection across the top left, as if the sand were behind glass.
-    private static func drawSheen(_ ctx: inout GraphicsContext, _ rect: CGRect) {
+    fileprivate static func drawSheen(_ ctx: inout GraphicsContext, _ rect: CGRect) {
         var sheen = Path()
         sheen.move(to: CGPoint(x: rect.minX, y: rect.minY + rect.height * 0.32))
         sheen.addLine(to: CGPoint(x: rect.minX + rect.width * 0.62, y: rect.minY))
@@ -148,6 +133,44 @@ enum SandDrawing {
             Gradient(colors: [.white.opacity(0), .white.opacity(0.05), .white.opacity(0)]),
             startPoint: CGPoint(x: rect.minX, y: rect.minY + rect.height * 0.3),
             endPoint: CGPoint(x: rect.minX + rect.width * 0.45, y: rect.minY + rect.height * 0.05)))
+    }
+}
+
+/// The glass behind the sand.
+struct GlassBack: View {
+    let glass: HourglassGeometry
+    let layout: SandLayout
+
+    var body: some View {
+        Canvas { ctx, _ in
+            var (cells, point) = SandDrawing.cells(ctx, layout)
+            SandDrawing.drawGlassBack(&cells, glass, point: point)
+        }
+    }
+}
+
+/// The glass in front of the sand, with its highlights, and the wooden frame.
+struct GlassFront: View {
+    let glass: HourglassGeometry
+    let layout: SandLayout
+
+    var body: some View {
+        Canvas { ctx, _ in
+            var (cells, point) = SandDrawing.cells(ctx, layout)
+            SandDrawing.drawGlassFront(&cells, glass, point: point)
+            SandDrawing.drawFrame(&cells, glass, point: point)
+        }
+    }
+}
+
+/// The sandbox's sheen, as if the sand were behind glass.
+struct Sheen: View {
+    let rect: CGRect
+
+    var body: some View {
+        Canvas { ctx, _ in
+            SandDrawing.drawSheen(&ctx, rect)
+        }
     }
 }
 

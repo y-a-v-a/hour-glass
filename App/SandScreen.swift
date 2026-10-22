@@ -6,6 +6,7 @@ struct SandScreen: View {
     let controller: SandController
     let palette: SandPalette
     let mode: SandMode
+    let grain: GrainSize
     /// The hourglass's turn while it's being flipped, in degrees.
     let flipAngle: Double
     /// Shown big in the middle while the Digital Crown sets the timer.
@@ -21,21 +22,9 @@ struct SandScreen: View {
     var body: some View {
         ZStack {
             Backdrop(palette: palette)
-            // Asleep, the sand only needs checking now and then for the wrist moving.
-            TimelineView(.animation(minimumInterval: controller.activity.isAsleep ? 0.2 : 1.0 / 60,
-                                    paused: dimmed || phase != .active)) { timeline in
-                ZStack {
-                    Canvas(rendersAsynchronously: false) { ctx, size in
-                        controller.frame(at: timeline.date, size: size, scale: displayScale)
-                        SandDrawing.draw(in: &ctx, controller: controller)
-                    }
-                    .rotationEffect(.degrees(flipAngle),
-                                    anchor: UnitPoint(x: controller.turnAnchor.x, y: controller.turnAnchor.y))
-
-                    if mode == .hourglass {
-                        countdown
-                            .opacity(flipAngle == 0 ? 1 : 0)
-                    }
+            GeometryReader { proxy in
+                if let layout = controller.layout(for: proxy.size, scale: displayScale, grain: grain, mode: mode) {
+                    stage(layout)
                 }
             }
             if let badge {
@@ -56,20 +45,44 @@ struct SandScreen: View {
         .gesture(touch)
         .accessibilityElement()
         .accessibilityLabel(mode == .hourglass ? "Hourglass" : "Sand")
-        .accessibilityValue(mode == .hourglass ? countdownText(controller.remaining) + " left" : "")
+        .accessibilityValue(mode == .hourglass ? countdownText(Double(controller.activity.countdown)) + " left" : "")
     }
 
-    /// The time left, engraved on the bottom cap.
+    /// The sand between the glass and the frame, which only change with the layout.
+    private func stage(_ layout: SandLayout) -> some View {
+        let glass = controller.container?.glass
+        return ZStack(alignment: .topLeading) {
+            ZStack(alignment: .topLeading) {
+                if let glass { GlassBack(glass: glass, layout: layout) }
+                sand(layout)
+                if let glass {
+                    GlassFront(glass: glass, layout: layout)
+                } else {
+                    Sheen(rect: layout.gridRect)
+                }
+            }
+            .rotationEffect(.degrees(flipAngle), anchor: layout.turnAnchor)
+
+            if mode == .hourglass, let glass {
+                Countdown(activity: controller.activity, cap: SandDrawing.bottomCap(of: glass, layout: layout))
+                    .opacity(flipAngle == 0 ? 1 : 0)
+            }
+        }
+        .frame(width: layout.viewSize.width, height: layout.viewSize.height, alignment: .topLeading)
+    }
+
+    /// While the screen is live, a new image of the sand every frame; otherwise (the always-on
+    /// display, or the app not in front) the last one, with no timeline running at all.
     @ViewBuilder
-    private var countdown: some View {
-        if let glass = controller.container?.glass {
-            let cap = SandDrawing.bottomCap(of: glass, controller: controller)
-            Text(countdownText(controller.displayedTime))
-                .font(.system(size: 11, weight: .semibold, design: .rounded))
-                .monospacedDigit()
-                .foregroundStyle(Color(red: 1, green: 0.88, blue: 0.62).opacity(controller.isTiming ? 0.95 : 0.6))
-                .shadow(color: .black.opacity(0.6), radius: 0.5, y: 0.5)
-                .position(x: cap.midX, y: cap.midY)
+    private func sand(_ layout: SandLayout) -> some View {
+        if dimmed || phase != .active {
+            SandImage(image: controller.frame(at: .now, live: false), rect: layout.gridRect)
+        } else {
+            // Asleep, the sand only needs checking now and then for the wrist moving.
+            TimelineView(.animation(minimumInterval: controller.activity.isAsleep ? 0.2 : 1.0 / 60)) { timeline in
+                SandImage(image: controller.frame(at: timeline.date, live: timeline.cadence == .live),
+                          rect: layout.gridRect)
+            }
         }
     }
 
@@ -94,5 +107,37 @@ struct SandScreen: View {
                 dragging = false
                 touchStart = nil
             }
+    }
+}
+
+/// One pixel per grain, scaled up without smoothing so every grain stays crisp. A plain image
+/// rather than a canvas, so a new frame is just new contents for its layer.
+private struct SandImage: View {
+    let image: CGImage?
+    let rect: CGRect
+
+    var body: some View {
+        if let image {
+            Image(decorative: image, scale: 1)
+                .resizable()
+                .interpolation(.none)
+                .frame(width: rect.width, height: rect.height)
+                .offset(x: rect.minX, y: rect.minY)
+        }
+    }
+}
+
+/// The time left, engraved on the bottom cap.
+private struct Countdown: View {
+    let activity: SandActivity
+    let cap: CGRect
+
+    var body: some View {
+        Text(countdownText(Double(activity.countdown)))
+            .font(.system(size: 11, weight: .semibold, design: .rounded))
+            .monospacedDigit()
+            .foregroundStyle(Color(red: 1, green: 0.88, blue: 0.62).opacity(activity.isTiming ? 0.95 : 0.6))
+            .shadow(color: .black.opacity(0.6), radius: 0.5, y: 0.5)
+            .position(x: cap.midX, y: cap.midY)
     }
 }
