@@ -67,15 +67,8 @@ final class SandController {
     private static let framesBeforeSlowing = 210
     private var lastDate: Date?
     private var frameDebt: Double = 0
-    /// Since the sand was last rendered: frames gone by, and grain moves made. And whether that
-    /// render drew anything that only lasts a frame (highlights on moving grains, streaks, glints)
-    /// and the light direction it used.
-    private var framesSinceRender = 0
-    private var movesSinceRender = 0
-    private var renderFades = false
-    private var renderedLight = -1
-    /// Sand at rest is still rendered this often, in frames, so it keeps twinkling.
-    private static let glintEvery = 6
+    /// Which frames need the sand rendering again.
+    private var renders = RenderSchedule()
     /// How long the last simulated frame took, in seconds.
     private var lastSimulationTime: Double = 0
     private var suspendedAt: Date?
@@ -158,33 +151,21 @@ final class SandController {
             quietFrames = moves == 0 ? quietFrames + 1 : 0
         }
 
-        movesSinceRender += moves
-        renderIfChanged(world)
+        // Rendered again only if it can look any different: on a long hourglass most frames move no
+        // grain at all, and showing the last image again costs SwiftUI next to nothing either.
+        let lighting = SandRenderer.lighting(gravityX: lightX, gravityY: lightY)
+        if let renderer, let stillFrames = renders.frame(moves: moves, lighting: lighting) {
+            renderer.render(world, gravityX: lightX, gravityY: lightY, sparkle: palette.packedSparkle,
+                            stillFrames: stillFrames)
+            image = renderer.makeImage()
+            renders.rendered(lighting: lighting, streaks: renderer.drewStreaks, glints: renderer.drewGlints)
+        }
         return image
-    }
-
-    /// Renders the sand, unless it would look just as it did. On a long hourglass most frames move
-    /// no grain at all, and a frame that isn't re-rendered costs SwiftUI next to nothing either.
-    private func renderIfChanged(_ world: SandWorld) {
-        guard let renderer else { return }
-        // Which way the light falls: the renderer only cares whether it's mostly vertical, and from
-        // which side.
-        let light = abs(lightY) >= abs(lightX) ? (lightY >= 0 ? 0 : 1) : (lightX >= 0 ? 2 : 3)
-        framesSinceRender += 1
-        guard image == nil || movesSinceRender > 0 || renderFades || light != renderedLight
-                || framesSinceRender >= Self.glintEvery else { return }
-        renderer.render(world, gravityX: lightX, gravityY: lightY, sparkle: palette.packedSparkle,
-                        stillFrames: framesSinceRender)
-        image = renderer.makeImage()
-        renderFades = movesSinceRender > 0 || renderer.drewStreaks || renderer.drewGlints
-        renderedLight = light
-        framesSinceRender = 0
-        movesSinceRender = 0
     }
 
     /// Makes sure the next frame is rendered afresh, for when the sand changed outside a frame.
     private func renderNextFrame() {
-        renderedLight = -1
+        renders.invalidate()
     }
 
     /// An image of the sand as it is, without moving it.

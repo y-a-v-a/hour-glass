@@ -92,8 +92,9 @@ public final class SandRenderer {
         // down each column when gravity is mostly vertical (all columns at once, a row at a time,
         // so memory is read in order), or along each row when it's sideways. Either way that's one
         // sweep through the cells, forwards or backwards.
-        let vertical = abs(gravityY) >= abs(gravityX)
-        let backwards = vertical ? gravityY < 0 : gravityX < 0
+        let lighting = Self.lighting(gravityX: gravityX, gravityY: gravityY)
+        let vertical = lighting == .fromAbove || lighting == .fromBelow
+        let backwards = lighting == .fromBelow || lighting == .fromRight
         let columnDepth = columnDepth
         columnDepth.update(repeating: 0, count: w)
 
@@ -200,6 +201,18 @@ public final class SandRenderer {
                 if Int32(pixels[t] >> 24) < alpha { pixels[t] = premultiplied(base, alpha) }
             }
         }
+    }
+
+    /// Which way the light falls, as far as the picture is concerned: against gravity, from whichever
+    /// side of the screen gravity mostly points away from.
+    public enum Lighting: Sendable {
+        case fromAbove, fromBelow, fromLeft, fromRight
+    }
+
+    public static func lighting(gravityX: Float, gravityY: Float) -> Lighting {
+        abs(gravityY) >= abs(gravityX)
+            ? (gravityY >= 0 ? .fromAbove : .fromBelow)
+            : (gravityX >= 0 ? .fromLeft : .fromRight)
     }
 
     /// A random value in `0..<1` for cell `i` in render `tick`: a hash rather than a running
