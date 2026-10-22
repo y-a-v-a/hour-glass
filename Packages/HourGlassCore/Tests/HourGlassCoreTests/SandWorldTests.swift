@@ -47,6 +47,28 @@ final class SandWorldTests: XCTestCase {
         XCTAssertEqual(countCells(world, SandWorld.wall), walls)
     }
 
+    func testTinyAndOddSizedGridsKeepTheirSand() {
+        // The engine reads the grid eight cells at a time; sizes either side of a multiple of eight,
+        // and grids too small for a block at all, take the edge cases.
+        for (w, h) in [(3, 3), (4, 7), (8, 8), (9, 9), (10, 17), (15, 16), (16, 15), (17, 23), (31, 9)] {
+            let world = SandWorld(width: w, height: h, seed: UInt64(w * 100 + h))
+            let container = Container.screen(width: w, height: h, cornerRadius: Float(min(w, h)) * 0.2)
+            world.apply(container)
+            world.parameters = .tuned(forHeight: h)
+            let grains = world.fill(container.interiorCount / 2) { _, _ in (0xFFFF_FFFF, 1) }
+            let walls = countCells(world, SandWorld.wall)
+            var rng = FastRandom(seed: 5)
+            for s in 0..<600 {
+                world.step(ax: rng.signedUnit() * 0.6, ay: rng.signedUnit() * 0.6,
+                           agitation: s % 50 < 3 ? 1 : 0, drag: s % 100 < 30 ? 0.02 : 0)
+                if s == 300 { world.burst(x: Float(w) / 2, y: Float(h) / 2, radius: Float(w), strength: 3) }
+            }
+            XCTAssertEqual(world.grainCount, grains, "\(w)x\(h)")
+            XCTAssertEqual(countCells(world, SandWorld.grain), grains, "\(w)x\(h)")
+            XCTAssertEqual(countCells(world, SandWorld.wall), walls, "\(w)x\(h)")
+        }
+    }
+
     func testSettledSandIsSupportedAndGoesQuiet() {
         let (world, _) = screenWorld()
         settle(world, grains: 800)
