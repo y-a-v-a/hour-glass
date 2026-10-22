@@ -28,7 +28,7 @@ final class GoldenStateTests: XCTestCase {
 enum GoldenScenes {
     enum Expected {
         static let sandbox: UInt64 = 18_078_610_659_436_619_740
-        static let hourglass: UInt64 = 5_931_781_402_685_662_885
+        static let hourglass: UInt64 = 2_396_517_957_701_848_649
         static let slosh: UInt64 = 7_770_563_022_562_141_003
         static let render: UInt64 = 16_292_390_150_030_889_404
     }

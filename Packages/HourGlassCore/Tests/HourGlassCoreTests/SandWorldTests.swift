@@ -222,6 +222,34 @@ final class SandWorldTests: XCTestCase {
         XCTAssertEqual(world.grainCount, 500)
     }
 
+    func testCatchingUpOpensACraterAndBuildsACone() {
+        let w = 70, h = 84
+        let container = Container.hourglass(width: w, height: h)
+        let world = SandWorld(width: w, height: h)
+        world.apply(container)
+        let neck = world.neckRows!
+        world.fill(700, downward: true, rows: 0..<neck.lowerBound) { _, _ in (0xFFFF_FFFF, 0) }
+        world.transferThroughNeck(250, downward: true)
+        func surface(_ x: Int, from rows: [Int]) -> Int? {
+            rows.first { world.kind[$0 * w + x] == SandWorld.grain }
+        }
+        let top = Array(0..<neck.lowerBound), bottom = Array((neck.upperBound + 1)..<h)
+        // Above: the middle has sunk below the sides.
+        let middle = surface(35, from: top)!, side = surface(25, from: top)!
+        XCTAssertGreaterThan(middle, side + 3, "a crater over the neck")
+        // Below: a heap, highest in the middle.
+        let peak = surface(35, from: bottom)!, flank = surface(25, from: bottom)!
+        XCTAssertLessThan(peak, flank - 3, "a cone under the neck")
+        // Nothing left hanging in mid-air, above or below. (The grains over the neck rest on the
+        // neck's gate.)
+        for y in (top.dropLast() + bottom) where y < h - 1 {
+            for x in 0..<w where world.kind[y * w + x] == SandWorld.grain {
+                XCTAssertNotEqual(world.kind[(y + 1) * w + x], SandWorld.empty, "grain at \(x),\(y) floats")
+            }
+        }
+        XCTAssertEqual(world.grainCount, 700)
+    }
+
     func testDrainRemovesFromTheTop() {
         let (world, _) = screenWorld()
         settle(world, grains: 600)

@@ -953,47 +953,51 @@ public final class SandWorld {
                 grainCount(inRows: (neck.upperBound + 1)..<height))
     }
 
-    /// Moves up to `count` grains straight from the surface of the upper bulb to the surface of
-    /// the lower one, for catching up on time that passed while the screen was off.
-    /// `downward` says which way the sand is flowing in screen terms.
+    /// Moves up to `count` grains straight from the upper bulb to the lower one, for catching up on
+    /// time that passed while the screen was off or dimmed. `downward` says which way the sand is
+    /// flowing in screen terms.
+    ///
+    /// They leave from a crater over the neck and arrive in a cone beneath it, both with sides at
+    /// about the angle of repose, the way a real hourglass drains and fills; so whenever the sand
+    /// is looked at again it's already in the shape the running hourglass would have given it.
     @discardableResult
     public func transferThroughNeck(_ count: Int, downward: Bool) -> Int {
         guard let neck = neckRows, count > 0 else { return 0 }
         let upper = 0..<neck.lowerBound, lower = (neck.upperBound + 1)..<height
-        let sourceRows = downward ? Array(upper) : Array(lower.reversed())
-        let targetRows = downward ? Array(lower.reversed()) : Array(upper)
-        var room = 0
-        for y in targetRows {
-            for x in 0..<width where kind[y * width + x] == Self.empty { room += 1 }
-        }
-        let count = min(count, room)
-        guard count > 0 else { return 0 }
+        let (source, target) = downward ? (upper, lower) : (lower, upper)
+        let centre = Float(width) / 2
+        /// How far along the flow row `y` is.
+        func depth(_ y: Int) -> Float { Float(downward ? y : height - 1 - y) }
+        /// Sideways distance from the middle of the neck, in rows of slope: tan 34°.
+        func aside(_ x: Int) -> Float { 0.67 * abs(Float(x) + 0.5 - centre) }
 
-        // Take from the upper bulb, starting at its free surface.
-        var taken: [(UInt32, UInt8)] = []
-        outer: for y in sourceRows {
-            for x in 0..<width {
-                let i = y * width + x
-                if kind[i] == Self.grain {
-                    taken.append((color[i], grainFlags[i]))
-                    removeGrain(at: i)
-                    if taken.count == count { break outer }
-                }
+        // Grains go in order of how far they are into the crater. Every grain lies further in than
+        // the one above it, so each column is taken from its surface down; a little noise breaks
+        // the ties between left and right.
+        var leaving: [(key: Float, cell: Int)] = []
+        for y in source {
+            for x in 0..<width where kind[y * width + x] == Self.grain {
+                leaving.append((depth(y) + aside(x) + rng.unit() * 0.01, y * width + x))
             }
         }
-        // Settle them onto the lower bulb, from its far end.
-        var next = 0
-        outer2: for y in targetRows {
-            for x in 0..<width where next < taken.count {
-                let i = y * width + x
-                if kind[i] == Self.empty {
-                    addGrain(at: i, color: taken[next].0, flags: taken[next].1)
-                    next += 1
-                }
+        // And arrive in order of how far down the cone a cell is: each column fills from the bottom.
+        var arriving: [(key: Float, cell: Int)] = []
+        for y in target {
+            for x in 0..<width where kind[y * width + x] == Self.empty {
+                arriving.append((aside(x) - depth(y) + rng.unit() * 0.01, y * width + x))
             }
-            if next == taken.count { break outer2 }
         }
-        return next
+        let moving = min(count, leaving.count, arriving.count)
+        guard moving > 0 else { return 0 }
+        leaving.sort { $0.key < $1.key }
+        arriving.sort { $0.key < $1.key }
+        for k in 0..<moving {
+            let from = leaving[k].cell
+            let (c, flags) = (color[from], grainFlags[from])
+            removeGrain(at: from)
+            addGrain(at: arriving[k].cell, color: c, flags: flags)
+        }
+        return moving
     }
 
     /// The stored velocity of the grain at `index`.

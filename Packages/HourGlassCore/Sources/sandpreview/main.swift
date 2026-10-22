@@ -341,6 +341,13 @@ func hourglassScene() {
     }
     scene.save("hourglass-3-later")
     scene.saveGIF("hourglass")
+    // Turned over again and left with the screen off: catching up moves the sand in one go.
+    scene.world.rotateHalfTurn()
+    scene.run(40)
+    scene.world.transferThroughNeck(scene.world.grainCount * 2 / 5, downward: true)
+    scene.save("hourglass-4-caught-up")
+    scene.run(30)
+    scene.save("hourglass-5-caught-up-and-running")
     let counts = scene.world.bulbCounts()!
     print("hourglass: above \(counts.above), below \(counts.below), capacity \(capacity)")
 }
@@ -526,27 +533,28 @@ func bench() {
     print("ms per frame (\(SandWorld.stepsPerFrame) steps), best of \(repeats) runs")
     for grain in options.grainGiven ? [options.grain] : [2, 3, 4] {
         for c in cases where options.benchCase.map({ $0 == c.name }) ?? true {
-            var simulate: [Double] = [], render: [Double] = []
+            var simulate: [Double] = [], render: [Double] = [], image: [Double] = []
             var grains = 0, size = ""
             for _ in 0..<repeats {
                 let scene = c.setup(grain)
-                var sim = 0.0, draw = 0.0
+                var sim = 0.0, draw = 0.0, wrap = 0.0
                 for n in 0..<c.frames {
                     sim += milliseconds { c.frame(scene, n) }
                     draw += milliseconds {
                         scene.renderer.render(scene.world, gravityX: scene.gravity.0, gravityY: scene.gravity.1,
                                               sparkle: scene.palette.packedSparkle)
-                        _ = scene.renderer.makeImage()
                     }
+                    wrap += milliseconds { _ = scene.renderer.makeImage() }
                 }
                 simulate.append(sim / Double(c.frames))
                 render.append(draw / Double(c.frames))
+                image.append(wrap / Double(c.frames))
                 grains = scene.world.grainCount
                 size = "\(scene.world.width)x\(scene.world.height)"
             }
             let name = c.name.padding(toLength: 9, withPad: " ", startingAt: 0)
-            print(String(format: "grain %dpx %@ %@, %5d grains: simulate %.3f  render %.3f",
-                         grain, name, size, grains, simulate.min()!, render.min()!))
+            print(String(format: "grain %dpx %@ %@, %5d grains: simulate %.3f  render %.3f  image %.3f",
+                         grain, name, size, grains, simulate.min()!, render.min()!, image.min()!))
         }
     }
 }
