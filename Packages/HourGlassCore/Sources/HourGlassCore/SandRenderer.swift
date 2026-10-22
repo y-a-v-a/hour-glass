@@ -68,7 +68,7 @@ public final class SandRenderer {
         precondition(world.width == width && world.height == height)
         let w = width, h = height
         let kind = world.kind, color = world.color, flags = world.grainFlags, moved = world.moved
-        let vx = world.velocityX, vy = world.velocityY
+        let velocities = world.velocities
         let frame = world.frame
         let level = Int32(brightness * 256)
         if level != factorsLevel {
@@ -124,7 +124,8 @@ public final class SandRenderer {
                 // Depth only matters down to the last shade, so it's kept small enough for a byte.
                 let depth = min(depth + 1, Self.depthLevels)
                 pixels[i] = shade(i, depth)
-                let sx = vx[i], sy = vy[i]
+                let v = velocities[i]
+                let sx = v.x, sy = v.y
                 if sx * sx + sy * sy > minSpeed * minSpeed {
                     fast[fastCount] = Int32(truncatingIfNeeded: i)
                     fastCount += 1
@@ -175,10 +176,11 @@ public final class SandRenderer {
                             backwards: Bool, level: Int32) {
         let w = width, h = height
         let kind = world.kind, color = world.color
-        let vx = world.velocityX, vy = world.velocityY
+        let velocities = world.velocities
         for n in 0..<count {
             let i = Int(fast[backwards ? count - 1 - n : n])
-            let sx = vx[i], sy = vy[i]
+            let v = velocities[i]
+            let sx = v.x, sy = v.y
             let speed2 = sx * sx + sy * sy
             let speed = speed2.squareRoot()
             // About how far the grain travelled this frame, so a thin trickle joins up.

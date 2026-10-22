@@ -85,8 +85,9 @@ public final class SandWorld {
     public let grainFlags: UnsafeMutablePointer<UInt8>
     /// The step number in which each grain last changed cell, so the renderer can light moving sand.
     public let moved: UnsafeMutablePointer<UInt8>
-    public let velocityX: UnsafeMutablePointer<Float>
-    public let velocityY: UnsafeMutablePointer<Float>
+    /// Each grain's velocity, in cells per step. Both components side by side, so a grain's
+    /// velocity is one read from memory.
+    public let velocities: UnsafeMutablePointer<SIMD2<Float>>
     /// The step number in which each grain was last updated, so a grain is moved at most once per step.
     private let stamp: UnsafeMutablePointer<UInt8>
     /// 1 for the metered cells of an hourglass neck.
@@ -123,8 +124,7 @@ public final class SandWorld {
         color = .allocate(capacity: n)
         grainFlags = .allocate(capacity: n)
         moved = .allocate(capacity: n)
-        velocityX = .allocate(capacity: n)
-        velocityY = .allocate(capacity: n)
+        velocities = .allocate(capacity: n)
         stamp = .allocate(capacity: n)
         gate = .allocate(capacity: n)
         occupied = .allocate(capacity: max(width, height))
@@ -138,8 +138,7 @@ public final class SandWorld {
         color.deallocate()
         grainFlags.deallocate()
         moved.deallocate()
-        velocityX.deallocate()
-        velocityY.deallocate()
+        velocities.deallocate()
         stamp.deallocate()
         gate.deallocate()
         occupied.deallocate()
@@ -169,8 +168,7 @@ public final class SandWorld {
         color.update(repeating: 0, count: n)
         grainFlags.update(repeating: 0, count: n)
         moved.update(repeating: 0, count: n)
-        velocityX.update(repeating: 0, count: n)
-        velocityY.update(repeating: 0, count: n)
+        velocities.update(repeating: .zero, count: n)
         stamp.update(repeating: 0, count: n)
         grainCount = 0
         gateTokens = 0
@@ -222,8 +220,7 @@ public final class SandWorld {
         let color: UnsafeMutablePointer<UInt32>
         let grainFlags: UnsafeMutablePointer<UInt8>
         let moved: UnsafeMutablePointer<UInt8>
-        let velocityX: UnsafeMutablePointer<Float>
-        let velocityY: UnsafeMutablePointer<Float>
+        let velocities: UnsafeMutablePointer<SIMD2<Float>>
         let stamp: UnsafeMutablePointer<UInt8>
         let gate: UnsafeMutablePointer<UInt8>
         let occupied: UnsafeMutablePointer<UInt8>
@@ -247,8 +244,7 @@ public final class SandWorld {
             color = world.color
             grainFlags = world.grainFlags
             moved = world.moved
-            velocityX = world.velocityX
-            velocityY = world.velocityY
+            velocities = world.velocities
             stamp = world.stamp
             gate = world.gate
             occupied = world.occupied
@@ -380,10 +376,7 @@ public final class SandWorld {
             let now = ones &* UInt64(frame), before = ones &* UInt64(previous)
             guard Self.zeroBytes(movedBytes ^ now) | Self.zeroBytes(movedBytes ^ before)
                     | Self.zeroBytes(stampBytes ^ now) == 0 else { return false }
-            for k in 0..<8 {
-                velocityX[b + k] = 0
-                velocityY[b + k] = 0
-            }
+            (velocities + b).update(repeating: .zero, count: 8)
             UnsafeMutableRawPointer(stamp).storeBytes(of: now, toByteOffset: b, as: UInt64.self)
             return true
         }
@@ -414,8 +407,7 @@ public final class SandWorld {
             }
             for k in 0..<8 {
                 let i = (y + k) * w + x
-                velocityX[i] = 0
-                velocityY[i] = 0
+                velocities[i] = .zero
                 stamp[i] = frame
             }
             return true
@@ -489,13 +481,12 @@ public final class SandWorld {
             // anywhere this step, so skip the work. (A grain still in flight goes the long way, so
             // its impact can splash the grains it hits.)
             if !inFlight && surrounded(start) {
-                velocityX[start] = 0
-                velocityY[start] = 0
+                velocities[start] = .zero
                 stamp[start] = frame
                 return
             }
-            var vx = velocityX[start] * p.drag
-            var vy = velocityY[start] * p.drag
+            var vx = velocities[start].x * p.drag
+            var vy = velocities[start].y * p.drag
             if glassDrag > 0 && (vx != 0 || vy != 0) {
                 let speed = (vx * vx + vy * vy).squareRoot()
                 let k = max(0, speed - glassDrag) / speed
@@ -556,7 +547,7 @@ public final class SandWorld {
                     let following = speed2 > 0.25 * p.impactSpeed * p.impactSpeed
                         && kind[target] == SandWorld.grain
                         && (moved[target] == frame || moved[target] == previous)
-                        && velocityX[target] * vx + velocityY[target] * vy > 0.3 * speed2
+                        && velocities[target].x * vx + velocities[target].y * vy > 0.3 * speed2
                     let impact = collide(target, dx, dy, inFlight || n > 1, &vx, &vy)
                     // What a deflected grain carries on with: after a hard landing only what
                     // survived the impact, otherwise its whole speed, so avalanches keep rolling.
@@ -593,8 +584,7 @@ public final class SandWorld {
                     break
                 }
             }
-            velocityX[i] = vx
-            velocityY[i] = vy
+            velocities[i] = SIMD2(vx, vy)
             stamp[i] = frame
         }
 
@@ -634,7 +624,7 @@ public final class SandWorld {
             let vn = vx * nx + vy * ny
             // Work relative to what was hit: a wall is still, a grain may be moving too.
             let isGrain = kind[target] == SandWorld.grain
-            let other = isGrain ? velocityX[target] * nx + velocityY[target] * ny : 0
+            let other = isGrain ? velocities[target].x * nx + velocities[target].y * ny : 0
             let closing = vn - other
             guard closing > 0 else { return false }
             if closing <= p.impactSpeed || !moving {
@@ -647,8 +637,8 @@ public final class SandWorld {
             if isGrain {
                 bounce = p.grainBounce
                 let kick = closing * p.splash
-                velocityX[target] += kick * nx
-                velocityY[target] += kick * ny
+                velocities[target].x += kick * nx
+                velocities[target].y += kick * ny
             } else {
                 bounce = p.wallBounce
                 if kind[target] == SandWorld.wall { impact += closing - p.impactSpeed }
@@ -762,11 +752,9 @@ public final class SandWorld {
         moved[to] = frame
         moved[from] = frame
         lastMoves += 1
-        velocityX[to] = velocityX[from]
-        velocityY[to] = velocityY[from]
+        velocities[to] = velocities[from]
         stamp[to] = stamp[from]
-        velocityX[from] = 0
-        velocityY[from] = 0
+        velocities[from] = .zero
     }
 
     // MARK: - Adding and removing sand
@@ -778,8 +766,7 @@ public final class SandWorld {
         kind[index] = Self.grain
         color[index] = c
         grainFlags[index] = flags
-        velocityX[index] = vx
-        velocityY[index] = vy
+        velocities[index] = SIMD2(vx, vy)
         moved[index] = frame
         grainCount += 1
         return true
@@ -789,8 +776,7 @@ public final class SandWorld {
     public func removeGrain(at index: Int) -> Bool {
         guard index >= 0, index < cellCount, kind[index] == Self.grain else { return false }
         kind[index] = Self.empty
-        velocityX[index] = 0
-        velocityY[index] = 0
+        velocities[index] = .zero
         grainCount -= 1
         return true
     }
@@ -904,8 +890,8 @@ public final class SandWorld {
         forEachGrain(nearX: x, y: y, radius: radius) { i, dx, dy, distance in
             let falloff = 1 - distance / radius
             let k = strength * falloff * falloff / max(distance, 0.5)
-            velocityX[i] += dx * k + rng.signedUnit() * strength * 0.15
-            velocityY[i] += dy * k + rng.signedUnit() * strength * 0.15
+            velocities[i].x += dx * k + rng.signedUnit() * strength * 0.15
+            velocities[i].y += dy * k + rng.signedUnit() * strength * 0.15
         }
     }
 
@@ -950,8 +936,8 @@ public final class SandWorld {
             relocate(grain.index, to: cell)
             let dx = Float(cell % width) + 0.5 - x, dy = Float(cell / width) + 0.5 - y
             let d = max((dx * dx + dy * dy).squareRoot(), 0.01)
-            velocityX[cell] = dx / d * 0.5 + fvx * 0.5
-            velocityY[cell] = dy / d * 0.5 + fvy * 0.5
+            velocities[cell].x = dx / d * 0.5 + fvx * 0.5
+            velocities[cell].y = dy / d * 0.5 + fvy * 0.5
         }
     }
 
@@ -982,18 +968,23 @@ public final class SandWorld {
             swap(&color[a], &color[b])
             swap(&grainFlags[a], &grainFlags[b])
             swap(&moved[a], &moved[b])
-            let (ax, ay) = (velocityX[a], velocityY[a])
-            velocityX[a] = -velocityX[b]
-            velocityY[a] = -velocityY[b]
-            velocityX[b] = -ax
-            velocityY[b] = -ay
+            let va = velocities[a]
+            velocities[a] = Self.reversed(velocities[b])
+            velocities[b] = Self.reversed(va)
             a += 1
             b -= 1
         }
         if a == b {
-            velocityX[a] = -velocityX[a]
-            velocityY[a] = -velocityY[a]
+            velocities[a] = Self.reversed(velocities[a])
         }
+    }
+
+    /// `v` the other way round. (Not `-v`: SIMD negation is `0 - v`, which turns a still grain's
+    /// zero velocity into +0 rather than -0. That doesn't move a grain any differently, but it's
+    /// kept exactly as it was.)
+    @inline(__always)
+    private static func reversed(_ v: SIMD2<Float>) -> SIMD2<Float> {
+        SIMD2(-v.x, -v.y)
     }
 
     /// Grains in rows `rows` (clamped to the grid).
@@ -1061,6 +1052,6 @@ public final class SandWorld {
 
     /// The stored velocity of the grain at `index`.
     public func velocity(at index: Int) -> (x: Float, y: Float) {
-        (velocityX[index], velocityY[index])
+        (velocities[index].x, velocities[index].y)
     }
 }

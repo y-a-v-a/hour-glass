@@ -56,8 +56,8 @@ enum GoldenScenes {
                 add(world.color[i])
                 add(world.grainFlags[i])
                 add(world.moved[i])
-                add(world.velocityX[i].bitPattern)
-                add(world.velocityY[i].bitPattern)
+                add(world.velocities[i].x.bitPattern)
+                add(world.velocities[i].y.bitPattern)
             }
             add(world.grainCount)
             add(world.frame)
