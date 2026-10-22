@@ -9,6 +9,9 @@ import UniformTypeIdentifiers
 //
 //   swift run -c release sandpreview [scene] [--out dir] [--palette id] [--grain px]
 //   scenes: pour, tilt, shake, hourglass, carve, palettes, bench, all (default)
+//
+//   swift run -c release sandpreview bench [--case name] [--grain px] [--repeats n]
+//   times the simulation and renderer; without --grain, at every grain size.
 
 struct Options {
     var scene = "all"
@@ -16,6 +19,10 @@ struct Options {
     var palette = SandPalette.sahara
     /// Pixels per grain on a 46 mm Series 11 (416 × 496 px).
     var grain = 3
+    var grainGiven = false
+    /// Benchmark only: the one case to time, and how many times to time each.
+    var benchCase: String?
+    var repeats = 7
 }
 
 var options = Options()
@@ -24,7 +31,9 @@ while let arg = args.popFirst() {
     switch arg {
     case "--out": options.out = URL(fileURLWithPath: args.popFirst() ?? "preview", isDirectory: true)
     case "--palette": options.palette = SandPalette.named(args.popFirst() ?? "")
-    case "--grain": options.grain = Int(args.popFirst() ?? "") ?? 3
+    case "--grain": options.grain = Int(args.popFirst() ?? "") ?? 3; options.grainGiven = true
+    case "--case": options.benchCase = args.popFirst()
+    case "--repeats": options.repeats = Int(args.popFirst() ?? "") ?? 7
     default: options.scene = arg
     }
 }
@@ -508,16 +517,15 @@ func bench() {
             scene.run(1)
         },
     ]
-    let repeats = 5
+    let repeats = options.repeats
     func milliseconds(_ body: () -> Void) -> Double {
         let start = DispatchTime.now().uptimeNanoseconds
         body()
         return Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
     }
-    func median(_ values: [Double]) -> Double { values.sorted()[values.count / 2] }
-    print("ms per frame (\(SandWorld.stepsPerFrame) steps), median of \(repeats) runs")
-    for grain in [2, 3, 4] {
-        for c in cases {
+    print("ms per frame (\(SandWorld.stepsPerFrame) steps), best of \(repeats) runs")
+    for grain in options.grainGiven ? [options.grain] : [2, 3, 4] {
+        for c in cases where options.benchCase.map({ $0 == c.name }) ?? true {
             var simulate: [Double] = [], render: [Double] = []
             var grains = 0, size = ""
             for _ in 0..<repeats {
@@ -538,7 +546,7 @@ func bench() {
             }
             let name = c.name.padding(toLength: 9, withPad: " ", startingAt: 0)
             print(String(format: "grain %dpx %@ %@, %5d grains: simulate %.3f  render %.3f",
-                         grain, name, size, grains, median(simulate), median(render)))
+                         grain, name, size, grains, simulate.min()!, render.min()!))
         }
     }
 }
@@ -550,7 +558,8 @@ let scenes: [String: () -> Void] = [
 if options.scene == "bench" {
     bench()
 } else {
-    for name in options.scene == "all" ? scenes.keys.sorted().filter { $0 != "icon" } : [options.scene] {
+    let names = options.scene == "all" ? scenes.keys.sorted().filter { $0 != "icon" } : [options.scene]
+    for name in names {
         guard let scene = scenes[name] else { print("unknown scene \(name)"); exit(1) }
         scene()
         if name == "icon" { stills.removeAll() } else { writeSheet("\(name)-sheet", columns: name == "palettes" ? 5 : 4) }
