@@ -457,30 +457,89 @@ func paletteScene() {
     }
 }
 
+/// Times the simulation and the renderer in the situations the app spends its time in, at each
+/// grain size. Every case is scripted from fixed seeds, so runs are comparable from build to build.
 func bench() {
-    for grain in [2, 3, 4] {
+    struct Case {
+        var name: String
+        var frames: Int
+        /// Builds the scene to be timed (untimed).
+        var setup: (Int) -> Scene
+        /// Simulates frame `n`.
+        var frame: (Scene, Int) -> Void
+    }
+    func settled(_ grain: Int) -> Scene {
         let scene = Scene(shape: .screen, palette: .sahara, grain: grain)
         let target = fillFraction(scene, 0.4)
         scene.run(150, pour: target / 150)
         scene.run(100)
-        let steps = 600 // frames, really
-        let start = Date()
-        // Keep the sand busy: slosh it around.
-        for s in 0..<steps {
-            let degrees = Float(s) * 0.9
-            scene.run(1, degrees: degrees, strength: 0.9)
+        return scene
+    }
+    let cases = [
+        // Sand sloshing round as the wrist turns: lots of grains in flight.
+        Case(name: "slosh", frames: 600, setup: settled) { scene, n in
+            scene.run(1, degrees: Float(n) * 0.9, strength: 0.9)
+        },
+        // Looking at the watch: the wrist sways a few degrees, so the sand stays awake, but
+        // nearly all of it is resting.
+        Case(name: "held", frames: 600, setup: settled) { scene, n in
+            scene.run(1, degrees: 4 * sinf(Float(n) * 0.05), strength: 0.8)
+        },
+        // The opening pour.
+        Case(name: "pour", frames: 150, setup: { Scene(shape: .screen, palette: .sahara, grain: $0) }) { scene, _ in
+            scene.run(1, pour: fillFraction(scene, 0.4) / 150)
+        },
+        // A one-minute hourglass running, turned over a moment before.
+        Case(name: "hourglass", frames: 600, setup: { grain in
+            let scene = Scene(shape: .hourglass, palette: .sahara, grain: grain)
+            let rows = scene.world.neckRows!
+            scene.world.fill(Int(Double(scene.container.bulbCapacity()) * 0.82),
+                             rows: (rows.upperBound + 1)..<scene.world.height) { rng, _ in
+                scene.palette.makeGrain(&rng)
+            }
+            scene.run(30)
+            scene.world.rotateHalfTurn()
+            scene.world.metersFlow = true
+            scene.run(60)
+            return scene
+        }) { scene, _ in
+            // All the sand through in 60 s.
+            scene.world.addGateTokens(Float(scene.world.grainCount) / 60 / 60)
+            scene.run(1)
+        },
+    ]
+    let repeats = 5
+    func milliseconds(_ body: () -> Void) -> Double {
+        let start = DispatchTime.now().uptimeNanoseconds
+        body()
+        return Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
+    }
+    func median(_ values: [Double]) -> Double { values.sorted()[values.count / 2] }
+    print("ms per frame (\(SandWorld.stepsPerFrame) steps), median of \(repeats) runs")
+    for grain in [2, 3, 4] {
+        for c in cases {
+            var simulate: [Double] = [], render: [Double] = []
+            var grains = 0, size = ""
+            for _ in 0..<repeats {
+                let scene = c.setup(grain)
+                var sim = 0.0, draw = 0.0
+                for n in 0..<c.frames {
+                    sim += milliseconds { c.frame(scene, n) }
+                    draw += milliseconds {
+                        scene.renderer.render(scene.world, gravityX: scene.gravity.0, gravityY: scene.gravity.1,
+                                              sparkle: scene.palette.packedSparkle)
+                        _ = scene.renderer.makeImage()
+                    }
+                }
+                simulate.append(sim / Double(c.frames))
+                render.append(draw / Double(c.frames))
+                grains = scene.world.grainCount
+                size = "\(scene.world.width)x\(scene.world.height)"
+            }
+            let name = c.name.padding(toLength: 9, withPad: " ", startingAt: 0)
+            print(String(format: "grain %dpx %@ %@, %5d grains: simulate %.3f  render %.3f",
+                         grain, name, size, grains, median(simulate), median(render)))
         }
-        let elapsed = Date().timeIntervalSince(start)
-        let renderStart = Date()
-        for _ in 0..<steps {
-            scene.renderer.render(scene.world, gravityX: 0, gravityY: 1, sparkle: 0xFFFF_FFFF)
-            _ = scene.renderer.makeImage()
-        }
-        let renderElapsed = Date().timeIntervalSince(renderStart)
-        print(String(format: "grain %dpx: %dx%d, %d grains: %.3f ms/frame (%d steps), %.3f ms/render",
-                     grain, scene.world.width, scene.world.height, scene.world.grainCount,
-                     elapsed / Double(steps) * 1000, SandWorld.stepsPerFrame,
-                     renderElapsed / Double(steps) * 1000))
     }
 }
 
