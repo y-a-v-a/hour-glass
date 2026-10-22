@@ -107,7 +107,7 @@ struct ContentView: View {
         if phase == .active && !dimmed {
             controller.resume(at: .now)
         } else {
-            controller.suspend(at: .now)
+            controller.suspend(at: .now, showing: dimmed)
         }
     }
 

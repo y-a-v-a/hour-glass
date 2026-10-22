@@ -17,6 +17,8 @@ final class SandActivity {
     /// The time on the hourglass's cap, in whole seconds, and whether it's counting down.
     var countdown = 0
     var isTiming = false
+    /// While the always-on display shows a running hourglass: its sand, a second at a time.
+    var dimmedImage: CGImage?
 }
 
 @MainActor
@@ -58,11 +60,21 @@ final class SandController {
     private var quietFrames = 0
     private var restingForces = SandForces(ax: 0, ay: 0)
     private static let framesBeforeSleep = 30
+    /// Once it has slept a few seconds more, the render loop slows down to just checking for
+    /// motion. Changing the loop's pace registers its timeline with the system afresh (for the
+    /// always-on display), so it's not done for every moment the sand comes to rest in a hand
+    /// that's never quite still.
+    private static let framesBeforeSlowing = 210
     private var lastDate: Date?
     private var frameDebt: Double = 0
     /// How long the last simulated frame took, in seconds.
     private var lastSimulationTime: Double = 0
     private var suspendedAt: Date?
+    /// How far the hourglass has been caught up since then, and the part of a grain still owed.
+    private var caughtUpAt: Date?
+    private var owedGrains: Double = 0
+    /// Moves a running hourglass along once a second while the always-on display shows it.
+    private var dimmedTicker: Timer?
 
     // MARK: Pouring
 
@@ -118,7 +130,11 @@ final class SandController {
         }
 
         if needsWaking(world) { wake() }
-        if quietFrames >= Self.framesBeforeSleep && image != nil { return image }
+        if quietFrames >= Self.framesBeforeSleep && image != nil {
+            quietFrames += 1
+            if quietFrames == Self.framesBeforeSlowing { setAsleep(true) }
+            return image
+        }
         // While awake, follow the forces; asleep, wake when they drift from where they settled.
         restingForces = forces
 
@@ -131,7 +147,6 @@ final class SandController {
         if mode == .hourglass { updateTimer(world) }
         if frames > 0 {
             quietFrames = moves == 0 ? quietFrames + 1 : 0
-            if quietFrames == Self.framesBeforeSleep { setAsleep(true) }
         }
 
         renderer?.render(world, gravityX: lightX, gravityY: lightY, sparkle: palette.packedSparkle)
@@ -434,30 +449,76 @@ final class SandController {
     // MARK: - Screen off and back
 
     /// The screen dimmed or the app left the foreground. Remember when, so the hourglass can catch
-    /// up, and arrange a tap on the wrist for when its sand would run out.
-    func suspend(at date: Date) {
-        guard suspendedAt == nil else { return }
-        suspendedAt = date
-        motion.stop()
-        if mode == .hourglass && isTiming {
-            session.scheduleAlarm(in: remaining)
+    /// up, and arrange a tap on the wrist for when its sand would run out. `showing` says the app is
+    /// still on the always-on display, dimmed: a running hourglass then keeps running there, a
+    /// second at a time, which is all the display shows anyway.
+    func suspend(at date: Date, showing: Bool) {
+        if suspendedAt == nil {
+            suspendedAt = date
+            caughtUpAt = date
+            owedGrains = 0
+            motion.stop()
+            if mode == .hourglass && isTiming {
+                session.scheduleAlarm(in: remaining)
+            }
+        }
+        if showing && mode == .hourglass && isTiming && dimmedTicker == nil {
+            dimmedTicker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.dimmedTick() }
+            }
         }
     }
 
     func resume(at date: Date) {
         motion.start()
+        stopDimmedTicker()
         defer {
             suspendedAt = nil
+            caughtUpAt = nil
             lastDate = nil
             wake()
         }
         guard let suspendedAt, let world, mode == .hourglass, isTiming else { return }
         session.cancelAlarm()
         // Move the sand that would have run through while nobody was looking.
-        let elapsed = date.timeIntervalSince(suspendedAt)
-        world.transferThroughNeck(Int(elapsed * rate), downward: flowsDownward)
+        catchUp(to: date)
         // If the alarm already went off with the screen off, don't let it ring again now.
         if let rang = session.rangAt, rang > suspendedAt { isTiming = false }
         updateTimer(world)
+    }
+
+    /// Moves the sand that ran through the neck since it was last caught up, straight from one
+    /// bulb to the other.
+    private func catchUp(to date: Date) {
+        guard let world, let from = caughtUpAt else { return }
+        let due = max(0, date.timeIntervalSince(from)) * rate + owedGrains
+        let count = Int(due)
+        owedGrains = due - Double(count)
+        caughtUpAt = date
+        world.transferThroughNeck(count, downward: flowsDownward)
+    }
+
+    /// A second on the always-on display: catch the sand up, and show it and the time left.
+    private func dimmedTick() {
+        guard suspendedAt != nil, mode == .hourglass, isTiming, let world, let renderer else {
+            stopDimmedTicker()
+            return
+        }
+        catchUp(to: .now)
+        guard let counts = world.bulbCounts() else { return }
+        renderer.render(world, gravityX: lightX, gravityY: lightY, sparkle: palette.packedSparkle)
+        image = renderer.makeImage()
+        activity.dimmedImage = image
+        let upper = flowsDownward ? counts.above : counts.below
+        let lower = flowsDownward ? counts.below : counts.above
+        // The alarm set when the screen dimmed taps the wrist when the last grain is through.
+        publish(countdown: Int((Double(upper > 0 ? upper : lower) / rate).rounded(.up)), timing: upper > 0)
+        if upper == 0 { stopDimmedTicker() }
+    }
+
+    private func stopDimmedTicker() {
+        dimmedTicker?.invalidate()
+        dimmedTicker = nil
+        activity.dimmedImage = nil
     }
 }

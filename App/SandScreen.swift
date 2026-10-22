@@ -76,7 +76,8 @@ struct SandScreen: View {
     @ViewBuilder
     private func sand(_ layout: SandLayout) -> some View {
         if dimmed || phase != .active {
-            SandImage(image: controller.frame(at: .now, live: false), rect: layout.gridRect)
+            SandImage(image: controller.activity.dimmedImage ?? controller.frame(at: .now, live: false),
+                      rect: layout.gridRect)
         } else {
             // Asleep, the sand only needs checking now and then for the wrist moving.
             TimelineView(.animation(minimumInterval: controller.activity.isAsleep ? 0.2 : 1.0 / 60)) { timeline in
