@@ -89,7 +89,7 @@ You'll need Xcode 26 and [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`bre
 scripts/build.sh                 # generate the project and build for the watch simulator
 scripts/build.sh --run           # ...and launch it in the simulator (with gravity swaying, see below)
 scripts/build.sh --device        # build for a real watch
-scripts/test.sh                  # run the simulation tests
+scripts/test.sh                  # run the simulation tests (--watch: on the watchOS simulator)
 scripts/preview.sh               # render scenes to preview/ without a watch: stills, sheets, GIFs
 scripts/preview.sh bench         # time the simulation and the renderer (--case held, --grain 3, ...)
 scripts/preview.sh icon          # re-render the app icon from the simulation
