@@ -4,26 +4,25 @@ import HourGlassCore
 import WatchKit
 
 /// Runs the sand: builds a world to fit the screen, steps it with the watch's motion and the
-/// wearer's touches, keeps the hourglass's time, and renders each frame for the canvas.
+/// wearer's touches, keeps the hourglass's time, and renders each frame as an image.
 ///
 /// It's a plain class rather than an observable one on purpose: it changes every frame, and the
-/// views that show it are redrawn every frame anyway by their `TimelineView`.
-/// The one thing about the sand the views need to watch: whether it has gone to sleep, so the
-/// render loop can slow down to just checking for motion.
+/// view that shows the sand is redrawn every frame anyway by its `TimelineView`.
+/// What the views do need to watch, and which changes far less often: whether the sand has gone to
+/// sleep, so the render loop can slow down to just checking for motion, and the hourglass's
+/// countdown, in whole seconds.
 @MainActor @Observable
 final class SandActivity {
     var isAsleep = false
+    /// The time on the hourglass's cap, in whole seconds, and whether it's counting down.
+    var countdown = 0
+    var isTiming = false
+    /// While the always-on display shows a running hourglass: its sand, a second at a time.
+    var dimmedImage: CGImage?
 }
 
 @MainActor
 final class SandController {
-    private struct Layout: Equatable {
-        var size: CGSize
-        var scale: CGFloat
-        var grain: GrainSize
-        var mode: SandMode
-    }
-
     let motion = MotionReader()
     let haptics = Haptics()
     let session = HourglassSession()
@@ -45,12 +44,8 @@ final class SandController {
     private(set) var container: Container?
     /// Cells the sand can occupy.
     private var openCells = 0
-    private var layout: Layout?
+    private(set) var layout: SandLayout?
     private(set) var image: CGImage?
-    /// The size of a cell in points.
-    private(set) var cellSize: CGFloat = 1.5
-    /// Where the grid's top-left corner sits in the view, in points.
-    private(set) var origin: CGPoint = .zero
     private var mapping = MotionMapping(gravityScale: 0.25)
     private(set) var forces = SandForces(ax: 0, ay: 0.2)
     /// Lights the sand from the last direction gravity had, for when the watch lies flat.
@@ -65,11 +60,23 @@ final class SandController {
     private var quietFrames = 0
     private var restingForces = SandForces(ax: 0, ay: 0)
     private static let framesBeforeSleep = 30
+    /// Once it has slept a few seconds more, the render loop slows down to just checking for
+    /// motion. Changing the loop's pace registers its timeline with the system afresh (for the
+    /// always-on display), so it's not done for every moment the sand comes to rest in a hand
+    /// that's never quite still.
+    private static let framesBeforeSlowing = 210
     private var lastDate: Date?
     private var frameDebt: Double = 0
+    /// Which frames need the sand rendering again.
+    private var renders = RenderSchedule()
     /// How long the last simulated frame took, in seconds.
     private var lastSimulationTime: Double = 0
     private var suspendedAt: Date?
+    /// How far the hourglass has been caught up since then, and the part of a grain still owed.
+    private var caughtUpAt: Date?
+    private var owedGrains: Double = 0
+    /// Moves a running hourglass along once a second while the always-on display shows it.
+    private var dimmedTicker: Timer?
 
     // MARK: Pouring
 
@@ -95,13 +102,19 @@ final class SandController {
     /// Grains per second through the neck.
     private var rate: Double { Double(max(hourglassGrains, 1)) / Double(max(timerSeconds, 1)) }
     private var flowsDownward = true
+    /// What `activity` was last told, so it's only told about changes.
+    private var publishedCountdown = -1
+    private var publishedTiming = false
 
     // MARK: - Frames
 
-    /// Advances to `date` and renders. Call once per displayed frame.
-    func frame(at date: Date, size: CGSize, scale: CGFloat) {
-        configureIfNeeded(size: size, scale: scale, date: date)
-        guard let world else { return }
+    /// The sand for the frame at `date`, advanced and rendered if `live`: the screen is on and
+    /// this is the frame being shown now. Anything else, such as the renders around a switch to
+    /// or from the always-on display, or one with a stale date, gets the last image. So the sand
+    /// only ever moves in real time, however often SwiftUI happens to draw.
+    func frame(at date: Date, live: Bool) -> CGImage? {
+        guard let world else { return nil }
+        guard live, abs(date.timeIntervalSinceNow) < 0.5 else { return image ?? still(world) }
 
         let dt = lastDate.map { min(max(date.timeIntervalSince($0), 0), 0.25) } ?? 1.0 / 60
         lastDate = date
@@ -118,8 +131,12 @@ final class SandController {
             lightY = forces.ay
         }
 
-        if needsWaking(world) { wake() }
-        if quietFrames >= Self.framesBeforeSleep && image != nil { return }
+        if needsWaking(world) { stayAwake() }
+        if quietFrames >= Self.framesBeforeSleep && image != nil {
+            quietFrames += 1
+            if quietFrames == Self.framesBeforeSlowing { setAsleep(true) }
+            return image
+        }
         // While awake, follow the forces; asleep, wake when they drift from where they settled.
         restingForces = forces
 
@@ -132,11 +149,31 @@ final class SandController {
         if mode == .hourglass { updateTimer(world) }
         if frames > 0 {
             quietFrames = moves == 0 ? quietFrames + 1 : 0
-            if quietFrames == Self.framesBeforeSleep { setAsleep(true) }
         }
 
+        // Rendered again only if it can look any different: on a long hourglass most frames move no
+        // grain at all, and showing the last image again costs SwiftUI next to nothing either.
+        let lighting = SandRenderer.lighting(gravityX: lightX, gravityY: lightY)
+        if let renderer, let stillFrames = renders.frame(moves: moves, lighting: lighting) {
+            renderer.render(world, gravityX: lightX, gravityY: lightY, sparkle: palette.packedSparkle,
+                            stillFrames: stillFrames)
+            image = renderer.makeImage()
+            renders.rendered(lighting: lighting, streaks: renderer.drewStreaks, glints: renderer.drewGlints)
+        }
+        return image
+    }
+
+    /// Makes sure the next frame is rendered afresh, for when the sand changed outside a frame.
+    private func renderNextFrame() {
+        renders.invalidate()
+    }
+
+    /// An image of the sand as it is, without moving it.
+    private func still(_ world: SandWorld) -> CGImage? {
         renderer?.render(world, gravityX: lightX, gravityY: lightY, sparkle: palette.packedSparkle)
         image = renderer?.makeImage()
+        renderNextFrame()
+        return image
     }
 
     /// Whether anything has happened that could set resting sand moving.
@@ -155,11 +192,17 @@ final class SandController {
 
     /// Something outside the simulation changed the sand: make sure it's simulated and redrawn.
     private func wake() {
+        stayAwake()
+        renderNextFrame()
+    }
+
+    private func stayAwake() {
         quietFrames = 0
         setAsleep(false)
     }
 
     private func setAsleep(_ asleep: Bool) {
+        motion.isIdle = asleep
         guard activity.isAsleep != asleep else { return }
         // Not in the middle of drawing a frame: let the views catch up afterwards.
         Task { @MainActor in self.activity.isAsleep = asleep }
@@ -173,6 +216,8 @@ final class SandController {
         case .hourglass: world.addGateTokens(Float(rate / 60))
         }
         let fingerVelocity = applyFinger(world)
+        // Sand pushed aside by a finger has moved, whether or not it goes on moving by itself.
+        if fingerVelocity != nil { renderNextFrame() }
         var impact: Float = 0
         var moves = 0
         for _ in 0..<SandWorld.stepsPerFrame {
@@ -189,31 +234,27 @@ final class SandController {
 
     // MARK: - Building the world
 
-    private func configureIfNeeded(size: CGSize, scale: CGFloat, date: Date) {
-        let wanted = Layout(size: size, scale: scale, grain: grain, mode: mode)
-        guard wanted != layout, size.width > 10, size.height > 10 else { return }
-        layout = wanted
+    /// The layout for a view of `size`, building a new world to fit if it has changed.
+    func layout(for size: CGSize, scale: CGFloat, grain: GrainSize, mode: SandMode) -> SandLayout? {
+        let wanted = SandLayout(size: size, scale: scale, grain: grain, mode: mode)
+        guard wanted.isUsable else { return layout }
+        if wanted != layout {
+            self.grain = grain
+            self.mode = mode
+            configure(wanted, date: .now)
+        }
+        return layout
+    }
 
-        cellSize = CGFloat(grain.rawValue) / scale
-        // The sandbox fills the screen. The hourglass stands below the row with the settings
-        // button and the clock, and keeps clear of the button in the bottom corner.
-        let area = mode == .sandbox
-            ? CGRect(origin: .zero, size: size)
-            : CGRect(x: 0, y: Self.hourglassTop(for: size), width: size.width,
-                     height: size.height - Self.hourglassTop(for: size) - 3)
-        let w = Int(area.width / cellSize), h = Int(area.height / cellSize)
-        origin = CGPoint(x: area.minX + (area.width - CGFloat(w) * cellSize) / 2,
-                         y: area.minY + (area.height - CGFloat(h) * cellSize) / 2)
-
+    private func configure(_ layout: SandLayout, date: Date) {
+        self.layout = layout
+        let w = layout.columns, h = layout.rows
         let container: Container
         switch mode {
         case .sandbox:
             container = .screen(width: w, height: h, cornerRadius: Float(w) * 0.21)
         case .hourglass:
-            let capRoom = Float((SandDrawing.Frame.capHeight + 1) / cellSize)
-            let buttonRoom: CGFloat = 52
-            let maxHalf = (size.width / 2 - buttonRoom - SandDrawing.Frame.reach) / cellSize
-            container = .hourglass(width: w, height: h, capRoom: capRoom, maxHalfWidth: Float(maxHalf))
+            container = .hourglass(width: w, height: h, capRoom: layout.capRoom, maxHalfWidth: layout.maxHalfWidth)
         }
         let world = SandWorld(width: w, height: h, seed: UInt64.random(in: 1...UInt64.max))
         world.apply(container)
@@ -242,19 +283,6 @@ final class SandController {
         }
     }
 
-    /// Where the hourglass's area starts, below the settings button and the clock.
-    static func hourglassTop(for size: CGSize) -> CGFloat {
-        max(44, size.height * 0.2)
-    }
-
-    /// The point the hourglass turns about, as a fraction of the view: the middle of its grid.
-    var turnAnchor: CGPoint {
-        guard let world, let layout else { return CGPoint(x: 0.5, y: 0.5) }
-        let x = origin.x + CGFloat(world.width) * cellSize / 2
-        let y = origin.y + CGFloat(world.height) * cellSize / 2
-        return CGPoint(x: x / layout.size.width, y: y / layout.size.height)
-    }
-
     /// Settles a fresh load of sand in the lower bulb.
     func refillHourglass() {
         guard let world, let container, let neck = world.neckRows else { return }
@@ -269,6 +297,8 @@ final class SandController {
         isTiming = false
         remaining = 0
         session.stop()
+        // The time it holds, on the cap straight away.
+        updateTimer(world)
         wake()
     }
 
@@ -301,6 +331,7 @@ final class SandController {
         let (gx, gy) = abs(forces.ax) + abs(forces.ay) > 0.01 ? (forces.ax, forces.ay) : (lightX, lightY)
         pourClock += 1
         if deficit > 0 {
+            renderNextFrame()
             let intro = introUntil.map { date < $0 } ?? false
             let streams = intro ? 3 : 1
             let perStream = min(deficit / streams + 1, max(12, world.width / 5))
@@ -318,6 +349,7 @@ final class SandController {
             }
         } else if deficit < -world.width / 4 {
             world.drain(min(-deficit, world.width / 2), gravityX: gx, gravityY: gy)
+            renderNextFrame()
         }
     }
 
@@ -389,7 +421,9 @@ final class SandController {
     }
 
     private func cellPoint(_ point: CGPoint) -> CGPoint {
-        CGPoint(x: (point.x - origin.x) / cellSize, y: (point.y - origin.y) / cellSize)
+        guard let layout else { return .zero }
+        return CGPoint(x: (point.x - layout.origin.x) / layout.cellSize,
+                       y: (point.y - layout.origin.y) / layout.cellSize)
     }
 
     // MARK: - Hourglass
@@ -417,35 +451,96 @@ final class SandController {
         }
         if running && !isTiming && remaining > 5 { session.start() }
         isTiming = running
+        publish(countdown: Int(max(0, displayedTime).rounded(.up)), timing: isTiming)
+    }
+
+    /// Tells the views about the countdown when it changes: about once a second, rather than
+    /// with every frame.
+    private func publish(countdown: Int, timing: Bool) {
+        guard countdown != publishedCountdown || timing != publishedTiming else { return }
+        publishedCountdown = countdown
+        publishedTiming = timing
+        // Not in the middle of drawing a frame: let the views catch up afterwards.
+        Task { @MainActor in
+            self.activity.countdown = countdown
+            self.activity.isTiming = timing
+        }
     }
 
     // MARK: - Screen off and back
 
     /// The screen dimmed or the app left the foreground. Remember when, so the hourglass can catch
-    /// up, and arrange a tap on the wrist for when its sand would run out.
-    func suspend(at date: Date) {
-        guard suspendedAt == nil else { return }
-        suspendedAt = date
-        motion.stop()
-        if mode == .hourglass && isTiming {
-            session.scheduleAlarm(in: remaining)
+    /// up, and arrange a tap on the wrist for when its sand would run out. `showing` says the app is
+    /// still on the always-on display, dimmed: a running hourglass then keeps running there, a
+    /// second at a time, which is all the display shows anyway.
+    func suspend(at date: Date, showing: Bool) {
+        if suspendedAt == nil {
+            suspendedAt = date
+            caughtUpAt = date
+            owedGrains = 0
+            motion.stop()
+            if mode == .hourglass && isTiming {
+                session.scheduleAlarm(in: remaining)
+            }
+        }
+        if showing && mode == .hourglass && isTiming && dimmedTicker == nil {
+            dimmedTicker = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.dimmedTick() }
+            }
         }
     }
 
     func resume(at date: Date) {
         motion.start()
+        stopDimmedTicker()
         defer {
             suspendedAt = nil
+            caughtUpAt = nil
             lastDate = nil
             wake()
         }
         guard let suspendedAt, let world, mode == .hourglass, isTiming else { return }
         session.cancelAlarm()
         // Move the sand that would have run through while nobody was looking.
-        let elapsed = date.timeIntervalSince(suspendedAt)
-        world.transferThroughNeck(Int(elapsed * rate), downward: flowsDownward)
+        catchUp(to: date)
         // If the alarm already went off with the screen off, don't let it ring again now.
         if let rang = session.rangAt, rang > suspendedAt { isTiming = false }
         updateTimer(world)
+    }
+
+    /// Moves the sand that ran through the neck since it was last caught up, straight from one
+    /// bulb to the other.
+    private func catchUp(to date: Date) {
+        guard let world, let from = caughtUpAt else { return }
+        let due = max(0, date.timeIntervalSince(from)) * rate + owedGrains
+        let count = Int(due)
+        owedGrains = due - Double(count)
+        caughtUpAt = date
+        world.transferThroughNeck(count, downward: flowsDownward)
+    }
+
+    /// A second on the always-on display: catch the sand up, and show it and the time left.
+    private func dimmedTick() {
+        guard suspendedAt != nil, mode == .hourglass, isTiming, let world, let renderer else {
+            stopDimmedTicker()
+            return
+        }
+        catchUp(to: .now)
+        guard let counts = world.bulbCounts() else { return }
+        renderer.render(world, gravityX: lightX, gravityY: lightY, sparkle: palette.packedSparkle)
+        image = renderer.makeImage()
+        renderNextFrame()
+        activity.dimmedImage = image
+        let upper = flowsDownward ? counts.above : counts.below
+        let lower = flowsDownward ? counts.below : counts.above
+        // The alarm set when the screen dimmed taps the wrist when the last grain is through.
+        publish(countdown: Int((Double(upper > 0 ? upper : lower) / rate).rounded(.up)), timing: upper > 0)
+        if upper == 0 { stopDimmedTicker() }
+    }
+
+    private func stopDimmedTicker() {
+        dimmedTicker?.invalidate()
+        dimmedTicker = nil
+        activity.dimmedImage = nil
     }
 }

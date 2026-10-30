@@ -14,15 +14,32 @@ public final class SandRenderer {
 
     /// Brightness by depth below the surface (256 = unchanged).
     private let depthShade: [Int32]
-    private var rng = FastRandom(seed: 0xD15C_0BA11)
+    /// The same with the overall level folded in, for still sand and then for moving sand.
+    private var shadeFactors = [Int32](repeating: 0, count: 2 * depthLevels)
+    private var factorsLevel: Int32 = -1
+    private static let depthLevels = 24
+    /// How deep each column's sand runs so far, while walking the rows.
+    private let columnDepth: UnsafeMutablePointer<UInt8>
+    /// Grains fast enough to leave a streak, in the order they were shaded.
+    private let fast: UnsafeMutablePointer<Int32>
+    /// Counts renders, so glints change from frame to frame.
+    private var tick: UInt64 = 0xD15C_0BA11
+    /// What the last render drew that will look different on the next one, even if no grain
+    /// moves in between: streaks behind fast grains, and glints.
+    public private(set) var drewStreaks = false
+    public private(set) var drewGlints = false
     private let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+    private lazy var pool = BufferPool(size: width * height * 4)
 
     public init(width: Int, height: Int) {
         self.width = width
         self.height = height
         pixels = .allocate(capacity: width * height)
         pixels.update(repeating: 0, count: width * height)
-        depthShade = (0..<24).map { depth in
+        columnDepth = .allocate(capacity: width + 8)
+        columnDepth.initialize(repeating: 0, count: width + 8)
+        fast = .allocate(capacity: width * height)
+        depthShade = (0..<Self.depthLevels).map { depth in
             let d = Float(max(depth, 1) - 1)
             return Int32((0.8 + 0.36 * expf(-d / 3.2)) * 256)
         }
@@ -30,6 +47,8 @@ public final class SandRenderer {
 
     deinit {
         pixels.deallocate()
+        columnDepth.deallocate()
+        fast.deallocate()
     }
 
     /// Shades every grain.
@@ -40,76 +59,130 @@ public final class SandRenderer {
     ///   - sparkle: Packed colour of a glint.
     ///   - brightness: Overall level, 1 for normal; lower for the always-on display.
     ///   - recentSteps: Grains that moved within this many steps count as moving.
+    ///   - stillFrames: How many frames this render stands for, as far as glints on resting sand
+    ///     go: when frames in which nothing moved weren't rendered, their share of glints comes now,
+    ///     so the sand twinkles as often as ever.
     public func render(_ world: SandWorld, gravityX: Float, gravityY: Float, sparkle: UInt32,
-                       brightness: Float = 1, recentSteps: Int = SandWorld.stepsPerFrame) {
+                       brightness: Float = 1, recentSteps: Int = SandWorld.stepsPerFrame,
+                       stillFrames: Int = 1) {
         precondition(world.width == width && world.height == height)
         let w = width, h = height
         let kind = world.kind, color = world.color, flags = world.grainFlags, moved = world.moved
+        let velocities = world.velocities
         let frame = world.frame
         let level = Int32(brightness * 256)
-
+        if level != factorsLevel {
+            factorsLevel = level
+            for depth in 0..<Self.depthLevels {
+                shadeFactors[depth] = (depthShade[depth] * level) >> 8
+                shadeFactors[Self.depthLevels + depth] = ((depthShade[depth] + 16) * level) >> 8
+            }
+        }
+        tick &+= 1
+        let tick = tick
+        let glint = scale(sparkle, level)
+        let stillGlint = min(1, 0.0025 * Float(max(1, stillFrames)))
+        var glints = 0
         let recent = UInt8(max(1, min(recentSteps, 200)))
-        @inline(__always)
-        func shade(_ i: Int, _ depth: Int) -> UInt32 {
-            // Step numbers wrap within 1...255.
-            let age = frame >= moved[i] ? frame - moved[i] : frame &+ (255 &- moved[i])
-            let movedNow = age < recent
-            if flags[i] & SandWorld.sparkleFlag != 0 {
-                let chance: Float = movedNow ? 0.3 : 0.0025
-                if rng.unit() < chance { return scale(sparkle, level) }
-            }
-            var f = depthShade[min(depth, depthShade.count - 1)]
-            if movedNow { f += 16 }
-            return scale(color[i], (f * level) >> 8)
-        }
+        let minSpeed: Float = 0.9
+        let fast = fast
+        var fastCount = 0
 
-        // Walk each line from the side gravity comes from, counting grains since the last gap.
-        if abs(gravityY) >= abs(gravityX) {
-            let fromTop = gravityY >= 0
-            for x in 0..<w {
-                var depth = 0
-                for r in 0..<h {
-                    let i = (fromTop ? r : h - 1 - r) * w + x
-                    if kind[i] == SandWorld.grain {
-                        depth += 1
-                        pixels[i] = shade(i, depth)
-                    } else {
-                        depth = 0
-                        pixels[i] = 0
+        // Walk the grid from the side gravity comes from, counting grains since the last gap:
+        // down each column when gravity is mostly vertical (all columns at once, a row at a time,
+        // so memory is read in order), or along each row when it's sideways. Either way that's one
+        // sweep through the cells, forwards or backwards.
+        let lighting = Self.lighting(gravityX: gravityX, gravityY: gravityY)
+        let vertical = lighting == .fromAbove || lighting == .fromBelow
+        let backwards = lighting == .fromBelow || lighting == .fromRight
+        let columnDepth = columnDepth
+        columnDepth.update(repeating: 0, count: w)
+
+        shadeFactors.withUnsafeBufferPointer { factors in
+            @inline(__always)
+            func shade(_ i: Int, _ depth: Int) -> UInt32 {
+                // Step numbers wrap within 1...255.
+                let age = frame >= moved[i] ? frame - moved[i] : frame &+ (255 &- moved[i])
+                let movedNow = age < recent
+                if flags[i] & SandWorld.sparkleFlag != 0 {
+                    let chance: Float = movedNow ? 0.3 : stillGlint
+                    if Self.random(i, tick) < chance {
+                        glints += 1
+                        return glint
                     }
                 }
+                let f = factors[(movedNow ? Self.depthLevels : 0) + min(depth, Self.depthLevels - 1)]
+                return scale(color[i], f)
             }
-        } else {
-            let fromLeft = gravityX >= 0
-            for y in 0..<h {
-                var depth = 0
+
+            /// Shades cell `i` of column `x` and returns its new depth.
+            @inline(__always)
+            func cell(_ i: Int, _ depth: Int) -> Int {
+                guard kind[i] == SandWorld.grain else {
+                    pixels[i] = 0
+                    return 0
+                }
+                // Depth only matters down to the last shade, so it's kept small enough for a byte.
+                let depth = min(depth + 1, Self.depthLevels)
+                pixels[i] = shade(i, depth)
+                let v = velocities[i]
+                let sx = v.x, sy = v.y
+                if sx * sx + sy * sy > minSpeed * minSpeed {
+                    fast[fastCount] = Int32(truncatingIfNeeded: i)
+                    fastCount += 1
+                }
+                return depth
+            }
+
+            let raw = UnsafeRawPointer(kind)
+            for r in 0..<h {
+                let y = backwards ? h - 1 - r : r
                 let row = y * w
-                for c in 0..<w {
-                    let i = row + (fromLeft ? c : w - 1 - c)
-                    if kind[i] == SandWorld.grain {
-                        depth += 1
-                        pixels[i] = shade(i, depth)
-                    } else {
-                        depth = 0
-                        pixels[i] = 0
+                var depth = 0
+                var c = 0
+                while c < w {
+                    let x = backwards ? w - 1 - c : c
+                    // Eight cells with no sand in them: clear them in one go.
+                    if c + 8 <= w {
+                        let first = backwards ? x - 7 : x
+                        let cells = raw.loadUnaligned(fromByteOffset: row + first, as: UInt64.self)
+                        if cells & 0x0101_0101_0101_0101 == 0 {
+                            (pixels + row + first).update(repeating: 0, count: 8)
+                            if vertical {
+                                UnsafeMutableRawPointer(columnDepth + first).storeBytes(of: 0, as: UInt64.self)
+                            }
+                            depth = 0
+                            c += 8
+                            continue
+                        }
                     }
+                    if vertical {
+                        columnDepth[x] = UInt8(truncatingIfNeeded: cell(row + x, Int(columnDepth[x])))
+                    } else {
+                        depth = cell(row + x, depth)
+                    }
+                    c += 1
                 }
             }
         }
-        drawTrails(world, level: level)
+        drewStreaks = fastCount > 0
+        drewGlints = glints > 0
+        drawTrails(world, fast: fast, count: fastCount, backwards: backwards, level: level)
     }
 
     /// Smears fast grains into short streaks behind them, as the eye would, so a trickle of sand
-    /// reads as a stream rather than a dotted line.
-    private func drawTrails(_ world: SandWorld, level: Int32) {
+    /// reads as a stream rather than a dotted line. Grains are taken in grid order, so where
+    /// streaks overlap evenly the same one wins whichever way the grid was walked.
+    private func drawTrails(_ world: SandWorld, fast: UnsafeMutablePointer<Int32>, count: Int,
+                            backwards: Bool, level: Int32) {
         let w = width, h = height
         let kind = world.kind, color = world.color
-        let vx = world.velocityX, vy = world.velocityY
-        let minSpeed: Float = 0.9
-        for i in 0..<(w * h) where kind[i] == SandWorld.grain {
-            let sx = vx[i], sy = vy[i]
+        let velocities = world.velocities
+        for n in 0..<count {
+            let i = Int(fast[backwards ? count - 1 - n : n])
+            let v = velocities[i]
+            let sx = v.x, sy = v.y
             let speed2 = sx * sx + sy * sy
-            guard speed2 > minSpeed * minSpeed else { continue }
             let speed = speed2.squareRoot()
             // About how far the grain travelled this frame, so a thin trickle joins up.
             let length = min(Int(speed * Float(SandWorld.stepsPerFrame) * 1.4), 18)
@@ -130,6 +203,30 @@ public final class SandRenderer {
         }
     }
 
+    /// Which way the light falls, as far as the picture is concerned: against gravity, from whichever
+    /// side of the screen gravity mostly points away from.
+    public enum Lighting: Sendable {
+        case fromAbove, fromBelow, fromLeft, fromRight
+    }
+
+    public static func lighting(gravityX: Float, gravityY: Float) -> Lighting {
+        abs(gravityY) >= abs(gravityX)
+            ? (gravityY >= 0 ? .fromAbove : .fromBelow)
+            : (gravityX >= 0 ? .fromLeft : .fromRight)
+    }
+
+    /// A random value in `0..<1` for cell `i` in render `tick`: a hash rather than a running
+    /// generator, so it doesn't matter in which order cells are shaded.
+    @inline(__always)
+    private static func random(_ i: Int, _ tick: UInt64) -> Float {
+        // SplitMix64's finaliser.
+        var z = UInt64(truncatingIfNeeded: i) &+ tick &* 0x9E37_79B9_7F4A_7C15
+        z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+        z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+        z ^= z >> 31
+        return Float(z >> 40) * (1.0 / 16_777_216.0)
+    }
+
     @inline(__always)
     private func premultiplied(_ c: UInt32, _ alpha: Int32) -> UInt32 {
         let r = (Int32(c & 0xFF) * alpha) / 255
@@ -147,13 +244,60 @@ public final class SandRenderer {
     }
 
     /// A snapshot of the pixels. It owns a copy, so the next render can't tear it.
+    ///
+    /// The copy goes into memory from a small pool, which each image gives back once it's done
+    /// with (when Core Animation lets go of it, on whichever thread), so a frame doesn't cost a
+    /// fresh allocation of a few hundred kilobytes, zeroed page by page.
     public func makeImage() -> CGImage? {
-        let data = Data(bytes: pixels, count: width * height * 4)
-        guard let provider = CGDataProvider(data: data as CFData) else { return nil }
+        let size = width * height * 4
+        let buffer = pool.take()
+        buffer.copyMemory(from: pixels, byteCount: size)
+        let info = Unmanaged.passRetained(pool).toOpaque()
+        guard let provider = CGDataProvider(dataInfo: info, data: buffer, size: size, releaseData: { info, data, _ in
+            let pool = Unmanaged<BufferPool>.fromOpaque(info!).takeRetainedValue()
+            pool.give(UnsafeMutableRawPointer(mutating: data))
+        }) else {
+            Unmanaged<BufferPool>.fromOpaque(info).release()
+            pool.give(buffer)
+            return nil
+        }
         return CGImage(
             width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
             bytesPerRow: width * 4, space: colorSpace,
             bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
             provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+    }
+}
+
+/// Image memory to be used again. Shared between the renderer and the images it has made, so it
+/// lasts until the last of them is gone.
+private final class BufferPool: @unchecked Sendable {
+    private let size: Int
+    private var free: [UnsafeMutableRawPointer] = []
+    private let lock = NSLock()
+    /// More than this many spare buffers are released: a frame or two in flight is the norm.
+    private static let keep = 3
+
+    init(size: Int) {
+        self.size = size
+    }
+
+    deinit {
+        for buffer in free { buffer.deallocate() }
+    }
+
+    func take() -> UnsafeMutableRawPointer {
+        lock.lock()
+        let buffer = free.popLast()
+        lock.unlock()
+        return buffer ?? .allocate(byteCount: size, alignment: 16)
+    }
+
+    func give(_ buffer: UnsafeMutableRawPointer) {
+        lock.lock()
+        let kept = free.count < Self.keep
+        if kept { free.append(buffer) }
+        lock.unlock()
+        if !kept { buffer.deallocate() }
     }
 }

@@ -47,6 +47,28 @@ final class SandWorldTests: XCTestCase {
         XCTAssertEqual(countCells(world, SandWorld.wall), walls)
     }
 
+    func testTinyAndOddSizedGridsKeepTheirSand() {
+        // The engine reads the grid eight cells at a time; sizes either side of a multiple of eight,
+        // and grids too small for a block at all, take the edge cases.
+        for (w, h) in [(3, 3), (4, 7), (8, 8), (9, 9), (10, 17), (15, 16), (16, 15), (17, 23), (31, 9)] {
+            let world = SandWorld(width: w, height: h, seed: UInt64(w * 100 + h))
+            let container = Container.screen(width: w, height: h, cornerRadius: Float(min(w, h)) * 0.2)
+            world.apply(container)
+            world.parameters = .tuned(forHeight: h)
+            let grains = world.fill(container.interiorCount / 2) { _, _ in (0xFFFF_FFFF, 1) }
+            let walls = countCells(world, SandWorld.wall)
+            var rng = FastRandom(seed: 5)
+            for s in 0..<600 {
+                world.step(ax: rng.signedUnit() * 0.6, ay: rng.signedUnit() * 0.6,
+                           agitation: s % 50 < 3 ? 1 : 0, drag: s % 100 < 30 ? 0.02 : 0)
+                if s == 300 { world.burst(x: Float(w) / 2, y: Float(h) / 2, radius: Float(w), strength: 3) }
+            }
+            XCTAssertEqual(world.grainCount, grains, "\(w)x\(h)")
+            XCTAssertEqual(countCells(world, SandWorld.grain), grains, "\(w)x\(h)")
+            XCTAssertEqual(countCells(world, SandWorld.wall), walls, "\(w)x\(h)")
+        }
+    }
+
     func testSettledSandIsSupportedAndGoesQuiet() {
         let (world, _) = screenWorld()
         settle(world, grains: 800)
@@ -116,6 +138,21 @@ final class SandWorldTests: XCTestCase {
             }
             // The neck is open, so sand can get through.
             XCTAssertGreaterThan(c.neck.filter { $0 }.count, 3)
+        }
+    }
+
+    func testANarrowerGridHoldsTheSameHourglass() {
+        for (w, h, maxHalf) in [(208, 195, Float(43.5)), (138, 126, 29.6), (104, 97, 21.8), (93, 111, 40)] {
+            let full = Container.hourglass(width: w, height: h, capRoom: 10, maxHalfWidth: maxHalf)
+            let narrowWidth = Container.hourglassWidth(fitting: w, height: h, capRoom: 10, maxHalfWidth: maxHalf)
+            let narrow = Container.hourglass(width: narrowWidth, height: h, capRoom: 10, maxHalfWidth: maxHalf)
+            XCTAssertLessThan(narrow.width, w * 3 / 4, "\(w)x\(h)")
+            XCTAssertEqual(narrow.glass!.bulbHalfWidth, full.glass!.bulbHalfWidth, "\(w)x\(h)")
+            XCTAssertEqual(narrow.interiorCount, full.interiorCount, "\(w)x\(h)")
+            XCTAssertEqual(narrow.bulbCapacity(), full.bulbCapacity(), "\(w)x\(h)")
+            // Still symmetric under a half turn, so turning it over only has to rotate the sand.
+            let n = narrow.width * h
+            XCTAssertTrue((0..<n).allSatisfy { narrow.walls[$0] == narrow.walls[n - 1 - $0] }, "\(w)x\(h)")
         }
     }
 
@@ -205,6 +242,23 @@ final class SandWorldTests: XCTestCase {
         }
     }
 
+    func testCountingGrainsInRows() {
+        let world = SandWorld(width: 13, height: 11, seed: 3)
+        world.apply(.screen(width: 13, height: 11, cornerRadius: 0))
+        world.fill(70) { _, _ in (0xFFFF_FFFF, 0) }
+        func slow(_ rows: Range<Int>) -> Int {
+            let lo = max(0, rows.lowerBound), hi = min(11, rows.upperBound)
+            guard lo < hi else { return 0 }
+            return (lo * 13..<hi * 13).filter { world.kind[$0] == SandWorld.grain }.count
+        }
+        for lo in -1...11 {
+            for hi in lo...12 {
+                XCTAssertEqual(world.grainCount(inRows: lo..<hi), slow(lo..<hi), "\(lo)..<\(hi)")
+            }
+        }
+        XCTAssertEqual(world.grainCount(inRows: 0..<11), 70)
+    }
+
     func testCatchingUpMovesSandBetweenBulbsWithoutLosingAny() {
         let container = Container.hourglass(width: 70, height: 84)
         let world = SandWorld(width: 70, height: 84)
@@ -220,6 +274,34 @@ final class SandWorldTests: XCTestCase {
         XCTAssertEqual(counts.above, 0)
         XCTAssertEqual(counts.below, 500)
         XCTAssertEqual(world.grainCount, 500)
+    }
+
+    func testCatchingUpOpensACraterAndBuildsACone() {
+        let w = 70, h = 84
+        let container = Container.hourglass(width: w, height: h)
+        let world = SandWorld(width: w, height: h)
+        world.apply(container)
+        let neck = world.neckRows!
+        world.fill(700, downward: true, rows: 0..<neck.lowerBound) { _, _ in (0xFFFF_FFFF, 0) }
+        world.transferThroughNeck(250, downward: true)
+        func surface(_ x: Int, from rows: [Int]) -> Int? {
+            rows.first { world.kind[$0 * w + x] == SandWorld.grain }
+        }
+        let top = Array(0..<neck.lowerBound), bottom = Array((neck.upperBound + 1)..<h)
+        // Above: the middle has sunk below the sides.
+        let middle = surface(35, from: top)!, side = surface(25, from: top)!
+        XCTAssertGreaterThan(middle, side + 3, "a crater over the neck")
+        // Below: a heap, highest in the middle.
+        let peak = surface(35, from: bottom)!, flank = surface(25, from: bottom)!
+        XCTAssertLessThan(peak, flank - 3, "a cone under the neck")
+        // Nothing left hanging in mid-air, above or below. (The grains over the neck rest on the
+        // neck's gate.)
+        for y in (top.dropLast() + bottom) where y < h - 1 {
+            for x in 0..<w where world.kind[y * w + x] == SandWorld.grain {
+                XCTAssertNotEqual(world.kind[(y + 1) * w + x], SandWorld.empty, "grain at \(x),\(y) floats")
+            }
+        }
+        XCTAssertEqual(world.grainCount, 700)
     }
 
     func testDrainRemovesFromTheTop() {

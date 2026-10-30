@@ -33,7 +33,9 @@ A standalone Apple Watch app (watchOS 10+), written in SwiftUI with a falling-sa
 - The **Digital Crown** sets the time, from 30 seconds to an hour. Turn it over halfway and it keeps
   time from where it is, just like a real one.
 - When the last grain falls, it **taps your wrist**, even with the screen off: a running hourglass keeps
-  the app alive as a mindfulness session, and catches up on the sand when you look again.
+  the app alive as a mindfulness session, and catches up on the sand when you look again. On the
+  always-on display it keeps running, a second at a time: the crater deepens, the cone grows and the
+  time counts down.
 
 **Sands** — Sahara, Pink Beach, Black Sand (with glinting volcanic glass), White Sands and Sand Art,
 which pours in coloured layers that fold as you tilt. In three grain sizes.
@@ -67,8 +69,17 @@ took a few rules about who gets first go at a hole; the tests pin them down.
 
 The renderer lights each heap from against gravity, so surface grains catch the light and deep sand
 sits in shade, flashes the odd glinting grain, and smears fast grains into short streaks so a trickle
-reads as a stream. Once the sand is at rest and the watch is still, the simulation goes to sleep and the
-render loop slows to a few checks a second.
+reads as a stream. The sand is drawn as an image, one pixel per grain, between the glass and the frame,
+which are drawn once.
+
+Most of a pile is buried and can't go anywhere, so the simulation reads the grid eight cells at a time
+and steps over empty air and buried sand in one go; it only does the real work for grains at the
+surface or in flight. A frame in which nothing visibly changed isn't drawn again, and once the sand is
+at rest and the watch is still, the simulation goes to sleep and the render loop slows to a few checks
+a second. With the screen dimmed, nothing runs but the hourglass's once-a-second catch-up.
+
+The tests pin all this down: besides checking how the sand behaves, they hash the whole world through
+scripted scenes, so a change meant only to make things faster has to leave the sand exactly as it was.
 
 ## Building
 
@@ -78,11 +89,14 @@ You'll need Xcode 26 and [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`bre
 scripts/build.sh                 # generate the project and build for the watch simulator
 scripts/build.sh --run           # ...and launch it in the simulator (with gravity swaying, see below)
 scripts/build.sh --device        # build for a real watch
-scripts/test.sh                  # run the simulation tests
+scripts/test.sh                  # run the simulation tests (--watch: on the watchOS simulator)
 scripts/preview.sh               # render scenes to preview/ without a watch: stills, sheets, GIFs
-scripts/preview.sh bench         # time the simulation
+scripts/preview.sh bench         # time the simulation and the renderer (--case held, --grain 3, ...)
 scripts/preview.sh icon          # re-render the app icon from the simulation
 ```
+
+`taskpolicy -b scripts/preview.sh bench` runs the benchmark on the Mac's efficiency cores, which are a
+fair stand-in for a watch's.
 
 **On your watch:** run `xcodegen generate`, open `HourGlass.xcodeproj`, pick the HourGlass scheme and
 your Apple Watch as the destination, and run. It's signed automatically with the team in
@@ -107,8 +121,8 @@ Here it is in the Apple Watch simulator with `-demo`, mid-avalanche:
 ## Layout
 
 - `App/` — the watch app: the render loop and touch (`SandScreen`), the frame-by-frame controller
-  (`SandController`), the hourglass's glass and wood (`SandDrawing`), Core Motion, haptics and the
-  background session.
+  (`SandController`), where the sand sits on screen (`SandLayout`), the hourglass's glass and wood
+  (`SandDrawing`), Core Motion, haptics and the background session.
 - `Packages/HourGlassCore/` — everything that doesn't need a watch: the simulation (`SandWorld`),
   container shapes, palettes, the renderer and the motion-to-forces mapping, with tests, and
   `sandpreview`, which renders scenes on the Mac.

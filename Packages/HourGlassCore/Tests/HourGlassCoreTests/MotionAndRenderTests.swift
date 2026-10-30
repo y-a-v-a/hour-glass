@@ -71,6 +71,31 @@ final class RendererTests: XCTestCase {
         XCTAssertEqual(image?.width, 20)
     }
 
+    func testImagesKeepTheirPixelsWhileLaterFramesAreRendered() {
+        let world = SandWorld(width: 30, height: 40)
+        world.apply(.screen(width: 30, height: 40, cornerRadius: 0))
+        world.fill(300) { _, _ in (SandPalette.pack(200, 150, 100), 0) }
+        let renderer = SandRenderer(width: 30, height: 40)
+        func bytes(_ image: CGImage) -> [UInt8] {
+            Array(image.dataProvider!.data! as Data)
+        }
+        renderer.render(world, gravityX: 0, gravityY: 1, sparkle: 0)
+        let first = renderer.makeImage()!
+        let firstBytes = bytes(first)
+        XCTAssertEqual(firstBytes.count, 30 * 40 * 4)
+        // Images go and come while the first is still held: its memory mustn't be handed out.
+        for n in 0..<6 {
+            world.drain(40, gravityX: 0, gravityY: 1)
+            renderer.render(world, gravityX: n % 2 == 0 ? 1 : 0, gravityY: 1, sparkle: 0)
+            let later = renderer.makeImage()!
+            XCTAssertNotEqual(bytes(later), firstBytes)
+            XCTAssertEqual(bytes(later), (0..<(30 * 40 * 4)).map { k in
+                UInt8(truncatingIfNeeded: renderer.pixels[k / 4] >> (8 * UInt32(k % 4)))
+            })
+        }
+        XCTAssertEqual(bytes(first), firstBytes)
+    }
+
     func testPalettesMakeVariedGrains() {
         var rng = FastRandom(seed: 7)
         for palette in SandPalette.all {

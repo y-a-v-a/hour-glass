@@ -85,12 +85,16 @@ public final class SandWorld {
     public let grainFlags: UnsafeMutablePointer<UInt8>
     /// The step number in which each grain last changed cell, so the renderer can light moving sand.
     public let moved: UnsafeMutablePointer<UInt8>
-    public let velocityX: UnsafeMutablePointer<Float>
-    public let velocityY: UnsafeMutablePointer<Float>
+    /// Each grain's velocity, in cells per step. Both components side by side, so a grain's
+    /// velocity is one read from memory.
+    public let velocities: UnsafeMutablePointer<SIMD2<Float>>
     /// The step number in which each grain was last updated, so a grain is moved at most once per step.
     private let stamp: UnsafeMutablePointer<UInt8>
     /// 1 for the metered cells of an hourglass neck.
     private let gate: UnsafeMutablePointer<UInt8>
+    /// Scratch for each step: which rows or columns hold sand (see `Stepper.markOccupied`).
+    private let occupied: UnsafeMutablePointer<UInt8>
+    private let columnBits: UnsafeMutablePointer<UInt64>
 
     public private(set) var grainCount = 0
     /// The current step number, wrapping 1...255.
@@ -106,7 +110,6 @@ public final class SandWorld {
     /// is how the hourglass keeps time.
     public var metersFlow = false
     private var gateTokens: Float = 0
-    private var glassDrag: Float = 0
 
     private var rng: FastRandom
 
@@ -115,14 +118,17 @@ public final class SandWorld {
         self.width = width
         self.height = height
         let n = width * height
-        kind = .allocate(capacity: n)
+        // Padded with wall, so a neighbourhood can be read a word at a time even at the last cell.
+        kind = .allocate(capacity: n + Self.padding)
+        (kind + n).initialize(repeating: Self.wall, count: Self.padding)
         color = .allocate(capacity: n)
         grainFlags = .allocate(capacity: n)
         moved = .allocate(capacity: n)
-        velocityX = .allocate(capacity: n)
-        velocityY = .allocate(capacity: n)
+        velocities = .allocate(capacity: n)
         stamp = .allocate(capacity: n)
         gate = .allocate(capacity: n)
+        occupied = .allocate(capacity: max(width, height))
+        columnBits = .allocate(capacity: (width + 7) / 8)
         rng = FastRandom(seed: seed)
         reset(walls: nil, neck: nil)
     }
@@ -132,11 +138,14 @@ public final class SandWorld {
         color.deallocate()
         grainFlags.deallocate()
         moved.deallocate()
-        velocityX.deallocate()
-        velocityY.deallocate()
+        velocities.deallocate()
         stamp.deallocate()
         gate.deallocate()
+        occupied.deallocate()
+        columnBits.deallocate()
     }
+
+    private static let padding = 8
 
     public var cellCount: Int { width * height }
 
@@ -159,8 +168,7 @@ public final class SandWorld {
         color.update(repeating: 0, count: n)
         grainFlags.update(repeating: 0, count: n)
         moved.update(repeating: 0, count: n)
-        velocityX.update(repeating: 0, count: n)
-        velocityY.update(repeating: 0, count: n)
+        velocities.update(repeating: .zero, count: n)
         stamp.update(repeating: 0, count: n)
         grainCount = 0
         gateTokens = 0
@@ -195,324 +203,558 @@ public final class SandWorld {
     ///     bumped and the sand hops.
     ///   - drag: Speed lost per step to friction against the glass, in cells per step.
     public func step(ax: Float, ay: Float, agitation: Float = 0, drag: Float = 0) {
-        glassDrag = drag
         frame = frame == 255 ? 1 : frame &+ 1
-        lastImpact = 0
-        lastMoves = 0
-        let w = width, h = height
-        let parity = Int(frame & 1)
+        var stepper = Stepper(world: self, ax: ax, ay: ay, agitation: agitation, glassDrag: drag)
+        stepper.run()
+        rng = stepper.rng
+        gateTokens = stepper.gateTokens
+        lastImpact = stepper.impact
+        lastMoves = stepper.moves
+    }
 
-        // Visit grains furthest along gravity first, so a falling column moves as one instead of
-        // each grain waiting a step for the one below it. Alternate the sideways direction from
-        // line to line and step to step: whichever neighbour is visited first gets first go at a
-        // gap, and a fixed order would steer every rising hole the same way.
-        if abs(ay) >= abs(ax) {
-            for r in 1..<(h - 1) {
-                let row = (ay >= 0 ? h - 1 - r : r) * w
-                let forward = (r + parity) & 1 == 0
-                for c in 1..<(w - 1) {
-                    let i = row + (forward ? c : w - 1 - c)
-                    if kind[i] == Self.grain && stamp[i] != frame {
-                        update(i, ax, ay, agitation)
-                    }
-                }
-            }
-        } else {
-            for c in 1..<(w - 1) {
-                let x = ax >= 0 ? w - 1 - c : c
-                let forward = (c + parity) & 1 == 0
+    /// One step's worth of work. Everything the step reads and writes is copied into a local value
+    /// first, so the inner loop runs out of registers rather than going back to the world (and the
+    /// runtime's exclusivity checks on its properties) for every grain.
+    private struct Stepper {
+        let kind: UnsafeMutablePointer<UInt8>
+        let color: UnsafeMutablePointer<UInt32>
+        let grainFlags: UnsafeMutablePointer<UInt8>
+        let moved: UnsafeMutablePointer<UInt8>
+        let velocities: UnsafeMutablePointer<SIMD2<Float>>
+        let stamp: UnsafeMutablePointer<UInt8>
+        let gate: UnsafeMutablePointer<UInt8>
+        let occupied: UnsafeMutablePointer<UInt8>
+        let columnBits: UnsafeMutablePointer<UInt64>
+        let width: Int
+        let height: Int
+        let p: Parameters
+        let frame: UInt8
+        /// The step before this one.
+        let previous: UInt8
+        let ax: Float, ay: Float, agitation: Float, glassDrag: Float
+        let metersFlow: Bool
+        var gateTokens: Float
+        var rng: FastRandom
+        /// What the step adds up for the world's `lastImpact` and `lastMoves`.
+        var impact: Float = 0
+        var moves = 0
+
+        init(world: SandWorld, ax: Float, ay: Float, agitation: Float, glassDrag: Float) {
+            kind = world.kind
+            color = world.color
+            grainFlags = world.grainFlags
+            moved = world.moved
+            velocities = world.velocities
+            stamp = world.stamp
+            gate = world.gate
+            occupied = world.occupied
+            columnBits = world.columnBits
+            width = world.width
+            height = world.height
+            p = world.parameters
+            frame = world.frame
+            previous = frame == 1 ? 255 : frame &- 1
+            self.ax = ax
+            self.ay = ay
+            self.agitation = agitation
+            self.glassDrag = glassDrag
+            metersFlow = world.metersFlow
+            gateTokens = world.gateTokens
+            rng = world.rng
+        }
+
+        mutating func run() {
+            let w = width, h = height
+            let parity = Int(frame & 1)
+
+            // Visit grains furthest along gravity first, so a falling column moves as one instead
+            // of each grain waiting a step for the one below it. Alternate the sideways direction
+            // from line to line and step to step: whichever neighbour is visited first gets first
+            // go at a gap, and a fixed order would steer every rising hole the same way.
+            if abs(ay) >= abs(ax) {
+                markOccupied(rows: true)
                 for r in 1..<(h - 1) {
-                    let i = (forward ? r : h - 1 - r) * w + x
-                    if kind[i] == Self.grain && stamp[i] != frame {
-                        update(i, ax, ay, agitation)
-                    }
-                }
-            }
-        }
-    }
-
-    @inline(__always)
-    private func update(_ start: Int, _ ax: Float, _ ay: Float, _ agitation: Float) {
-        // Most of a pile is buried: a grain at rest with all eight neighbours taken can't go
-        // anywhere this step, so skip the work. (A grain still in flight goes the long way, so its
-        // impact can splash the grains it hits.)
-        let w = width
-        if moved[start] != frame && moved[start] != (frame == 1 ? 255 : frame &- 1)
-            && kind[start - 1] != Self.empty && kind[start + 1] != Self.empty
-            && kind[start - w] != Self.empty && kind[start + w] != Self.empty
-            && kind[start - w - 1] != Self.empty && kind[start - w + 1] != Self.empty
-            && kind[start + w - 1] != Self.empty && kind[start + w + 1] != Self.empty {
-            velocityX[start] = 0
-            velocityY[start] = 0
-            stamp[start] = frame
-            return
-        }
-        let p = parameters
-        var vx = velocityX[start] * p.drag
-        var vy = velocityY[start] * p.drag
-        if glassDrag > 0 && (vx != 0 || vy != 0) {
-            let speed = (vx * vx + vy * vy).squareRoot()
-            let k = max(0, speed - glassDrag) / speed
-            vx *= k
-            vy *= k
-        }
-        vx += ax
-        vy += ay
-        if agitation > 0 {
-            vx += rng.signedUnit() * agitation
-            vy += rng.signedUnit() * agitation
-        }
-        let speed2 = vx * vx + vy * vy
-        if speed2 > p.maxSpeed * p.maxSpeed {
-            let k = p.maxSpeed / speed2.squareRoot()
-            vx *= k
-            vy *= k
-        }
-
-        var i = start
-        // Sand that's been sitting still can only press on what's under it. Letting it "hit" would
-        // turn the speed it gathers between moves into bounces that ripple through a resting pile.
-        let previous = frame == 1 ? 255 : frame &- 1
-        let inFlight = moved[start] == previous || moved[start] == frame
-        let absX = abs(vx), absY = abs(vy)
-        let m = max(absX, absY)
-        if m > 0.0001 {
-            // Move m cells this step on average: the whole part always, the fraction by chance.
-            // Each move is one cell along x, y or a diagonal, picked so the expected displacement
-            // matches the velocity — shallow angles don't get rounded away.
-            var steps = Int(m)
-            let fraction = m - Float(steps)
-            if rng.unit() < (inFlight ? fraction : fraction * p.restingProbeBoost) { steps += 1 }
-            let chanceX = absX / m, chanceY = absY / m
-            let stepX = vx < 0 ? -1 : 1
-            let stepY = vy < 0 ? -1 : 1
-            if steps == 0 && p.followsVacancies {
-                // If the grain ahead just moved off, follow it now rather than whenever the dice
-                // say so: that way a column or an overhang falls as one piece instead of
-                // crumbling a layer at a time.
-                let ahead = i + (absX >= absY ? stepX : stepY * width)
-                if kind[ahead] == Self.empty && (moved[ahead] == frame || moved[ahead] == previous) {
-                    steps = 1
-                }
-            }
-            var n = 0
-            while n < steps {
-                n += 1
-                let dx = chanceX >= 1 || rng.unit() < chanceX ? stepX : 0
-                let dy = chanceY >= 1 || rng.unit() < chanceY ? stepY : 0
-                let target = i + dx + dy * width
-                if enter(from: i, to: target) {
-                    shift(i, to: target)
-                    i = target
-                    continue
-                }
-
-                let headingX = vx, headingY = vy
-                // A grain blocked by one moving the same way just falls in behind it, the way a
-                // stream of sand stays a stream; only sand that's (nearly) still deflects it.
-                let speed2 = vx * vx + vy * vy
-                let following = speed2 > 0.25 * p.impactSpeed * p.impactSpeed
-                    && kind[target] == Self.grain
-                    && (moved[target] == frame || moved[target] == previous)
-                    && velocityX[target] * vx + velocityY[target] * vy > 0.3 * speed2
-                let impact = collide(target, dx, dy, inFlight || n > 1, &vx, &vy)
-                // What a deflected grain carries on with: after a hard landing only what survived
-                // the impact, otherwise its whole speed, so avalanches keep rolling.
-                let carried = impact
-                    ? (vx * vx + vy * vy).squareRoot()
-                    : (headingX * headingX + headingY * headingY).squareRoot()
-                if let (cell, ux, uy, rolled) = deflect(from: i, dx, dy, headingX, headingY,
-                                                         rollOnly: following) {
-                    shift(i, to: cell)
-                    i = cell
-                    if rolled {
-                        // Having climbed over a neighbour, carry on along the top of it.
-                        let speed = carried * (1 - p.slideFriction)
-                        let k: Float = dx != 0 && dy != 0 ? 0.707_106_8 : 1
-                        vx = Float(dx) * k * speed
-                        vy = Float(dy) * k * speed
+                    let y = ay >= 0 ? h - 1 - r : r
+                    guard occupied[y] != 0 else { continue }
+                    let row = y * w
+                    // Eight cells at a time where a whole block can be dealt with at once, one by
+                    // one where it can't.
+                    if (r + parity) & 1 == 0 {
+                        var c = 1
+                        while c < w - 1 {
+                            if c + 8 <= w - 1 && settle(block: row + c) {
+                                c += 8
+                                continue
+                            }
+                            visit(row + c)
+                            c += 1
+                        }
                     } else {
-                        // Keep sliding along the new direction, so avalanches pick up speed.
-                        let speed = carried * (1 - p.slideFriction)
-                        vx = ux * speed
-                        vy = uy * speed
+                        var c = w - 2
+                        while c >= 1 {
+                            if c - 7 >= 1 && settle(block: row + c - 7) {
+                                c -= 8
+                                continue
+                            }
+                            visit(row + c)
+                            c -= 1
+                        }
                     }
-                } else if kind[target] == Self.wall, let cell = slip(from: i, dx, dy, headingX, headingY) {
-                    shift(i, to: cell)
-                    i = cell
-                    vx = 0
-                    vy = 0
-                } else if !inFlight || vx * vx + vy * vy < p.restSpeed * p.restSpeed {
-                    // Static friction: sand that was sitting still and has nowhere downhill
-                    // enough to go stays put, whatever sideways speed it gathered meanwhile.
-                    vx = 0
-                    vy = 0
                 }
-                break
+            } else {
+                markOccupied(rows: false)
+                for c in 1..<(w - 1) {
+                    let x = ax >= 0 ? w - 1 - c : c
+                    guard occupied[x] != 0 else { continue }
+                    // Eight cells down the column at a time where possible, as along rows. A column
+                    // isn't contiguous, so checking a block costs more than along a row: where it
+                    // can't be dealt with whole, its cells are visited in turn before the next try.
+                    if (c + parity) & 1 == 0 {
+                        var r = 1
+                        while r < h - 1 {
+                            if r + 8 <= h - 1 {
+                                if !settle(column: x, from: r) {
+                                    for k in 0..<8 { visit((r + k) * w + x) }
+                                }
+                                r += 8
+                            } else {
+                                visit(r * w + x)
+                                r += 1
+                            }
+                        }
+                    } else {
+                        var r = h - 2
+                        while r >= 1 {
+                            if r - 7 >= 1 {
+                                if !settle(column: x, from: r - 7) {
+                                    for k in 0..<8 { visit((r - k) * w + x) }
+                                }
+                                r -= 8
+                            } else {
+                                visit(r * w + x)
+                                r -= 1
+                            }
+                        }
+                    }
+                }
             }
         }
-        velocityX[i] = vx
-        velocityY[i] = vy
-        stamp[i] = frame
-    }
 
-    /// Whether a grain at `from` may move into `to`, spending a neck token if it has to.
-    @inline(__always)
-    private func enter(from: Int, to: Int) -> Bool {
-        guard kind[to] == Self.empty else { return false }
-        if metersFlow && gate[to] != 0 && gate[from] == 0 {
-            // Straight in, unless no grain is waiting straight above the neck cell. Otherwise the
-            // grains sliding down the glass beside the neck get there first, and the hole each one
-            // leaves climbs up along the glass: the hourglass drains down its sides instead of
-            // opening a crater in the middle. (And without the exception, the last grains would
-            // sit on the ledge beside the neck for ever.)
-            let step = to - from
-            if step != width && step != -width && step != 1 && step != -1 {
-                let sideways = step > 0 ? (step == width + 1 ? 1 : -1) : (step == -width + 1 ? 1 : -1)
-                let straightAbove = to - (step - sideways)
-                if kind[straightAbove] == Self.grain { return false }
-            }
-            guard gateTokens >= 1 else { return false }
-            gateTokens -= 1
-        }
-        return true
-    }
-
-    /// Velocity response to being blocked moving by (dx, dy). Only a grain that's `moving` can
-    /// bounce or splash; otherwise the contact just stops it closing in.
-    /// Returns whether it was an impact rather than a resting contact.
-    @inline(__always)
-    private func collide(_ target: Int, _ dx: Int, _ dy: Int, _ moving: Bool,
-                         _ vx: inout Float, _ vy: inout Float) -> Bool {
-        let p = parameters
-        var nx = Float(dx), ny = Float(dy)
-        if dx != 0 && dy != 0 {
-            nx *= 0.707_106_8
-            ny *= 0.707_106_8
-        }
-        let vn = vx * nx + vy * ny
-        // Work relative to what was hit: a wall is still, a grain may be moving too.
-        let isGrain = kind[target] == Self.grain
-        let other = isGrain ? velocityX[target] * nx + velocityY[target] * ny : 0
-        let closing = vn - other
-        guard closing > 0 else { return false }
-        if closing <= p.impactSpeed || !moving {
-            // Resting contact: just stop closing in.
-            vx -= closing * nx
-            vy -= closing * ny
-            return false
-        }
-        let bounce: Float
-        if isGrain {
-            bounce = p.grainBounce
-            let kick = closing * p.splash
-            velocityX[target] += kick * nx
-            velocityY[target] += kick * ny
-        } else {
-            bounce = p.wallBounce
-            if kind[target] == Self.wall { lastImpact += closing - p.impactSpeed }
-        }
-        let keep = 1 - p.friction
-        let tx = vx - vn * nx, ty = vy - vn * ny
-        let normal = other - bounce * closing
-        vx = tx * keep + normal * nx
-        vy = ty * keep + normal * ny
-        return true
-    }
-
-    /// After being blocked moving by (dx, dy), tries the two neighbouring directions 45° either
-    /// side, most downhill first, as long as they're within the slide angle of the heading.
-    /// Returns the cell moved into, the unit direction of the move, and whether it was a roll-over.
-    @inline(__always)
-    private func deflect(from i: Int, _ dx: Int, _ dy: Int, _ hx: Float, _ hy: Float,
-                         rollOnly: Bool) -> (Int, Float, Float, Bool)?
-    {
-        let speed = (hx * hx + hy * hy).squareRoot()
-        guard speed > 0.0001 else { return nil }
-        let ux = hx / speed, uy = hy / speed
-
-        let ax, ay, bx, by: Int
-        if dx != 0 && dy != 0 {
-            (ax, ay, bx, by) = (dx, 0, 0, dy)
-        } else if dx != 0 {
-            (ax, ay, bx, by) = (dx, 1, dx, -1)
-        } else {
-            (ax, ay, bx, by) = (1, dy, -1, dy)
-        }
-        let sa: Float = ax != 0 && ay != 0 ? 0.707_106_8 : 1
-        let sb: Float = bx != 0 && by != 0 ? 0.707_106_8 : 1
-        let da = (Float(ax) * ux + Float(ay) * uy) * sa
-        let db = (Float(bx) * ux + Float(by) * uy) * sb
-
-        let aFirst = abs(da - db) < 0.04 ? rng.coinFlip() : da > db
-        let slide = parameters.slideCosine
-        // After a straight-on block, the less downhill diagonal climbs over what's in the way.
-        let roll = (dx == 0 || dy == 0) && kind[i + dx + dy * width] == Self.grain
-            ? parameters.rollCosine : slide
-        if rollOnly && roll >= slide { return nil }
-        for pass in 0..<2 {
-            let useA = (pass == 0) == aFirst
-            let d = useA ? da : db
-            guard d >= (pass == 0 ? slide : min(slide, roll)) else { continue }
-            // Behind a moving grain, only climbing over it is allowed: that thickens a flowing
-            // layer, while sliding aside would scatter a falling stream.
-            if rollOnly && d >= slide { continue }
-            let cx = useA ? ax : bx, cy = useA ? ay : by
-            let cell = i + cx + cy * width
-            // A grain only rolls over a neighbour if it can carry on along the top of it; otherwise
-            // rolling would slowly steepen slopes that are already stable.
-            if d < slide && kind[cell + dx + dy * width] != Self.empty { continue }
-            if enter(from: i, to: cell) {
-                let s = useA ? sa : sb
-                return (cell, Float(cx) * s, Float(cy) * s, d < slide)
+        @inline(__always)
+        private mutating func visit(_ i: Int) {
+            if kind[i] == SandWorld.grain && stamp[i] != frame {
+                update(i)
             }
         }
-        return nil
-    }
 
-    /// Glass is slicker than sand. A grain sitting on a ledge of the glass staircase (blocked
-    /// straight ahead by wall, with no open diagonal) may step sideways if the glass falls away
-    /// just beyond; sand-on-sand never does this, so piles keep their slopes, and a level floor
-    /// never qualifies. Without it a thin skin of sand clings to shallow glass for ever, and an
-    /// hourglass never quite runs out.
-    @inline(__always)
-    private func slip(from i: Int, _ dx: Int, _ dy: Int, _ hx: Float, _ hy: Float) -> Int? {
-        guard dx == 0 || dy == 0 else { return nil }
-        let ahead = dx + dy * width
-        let side = dx == 0 ? 1 : width
-        // Try the side gravity leans towards first.
-        let lean = dx == 0 ? hx : hy
-        let first = lean > 0 || (lean == 0 && rng.coinFlip()) ? side : -side
-        for d in [first, -first] {
+        /// Deals with the eight cells from `b` along the row in one go, if they need nothing or
+        /// the same thing: no sand at all, or eight grains at rest that are buried, which `update`
+        /// would just hold still. Returns `false` to have them visited one by one instead.
+        ///
+        /// Holding a buried grain still changes no cell, so what's checked here at the start holds
+        /// for all eight, and the outcome is exactly that of visiting them in turn.
+        @inline(__always)
+        private func settle(block b: Int) -> Bool {
+            let raw = UnsafeRawPointer(kind)
+            let cells = raw.loadUnaligned(fromByteOffset: b, as: UInt64.self)
+            let ones: UInt64 = 0x0101_0101_0101_0101
+            if cells & ones == 0 { return true }
+            guard cells == ones, kind[b - 1] != SandWorld.empty, kind[b + 8] != SandWorld.empty else {
+                return false
+            }
+            // Everything around is taken: the ten cells above and below, read as two overlapping
+            // words each.
+            let w = width
+            let around = Self.zeroBytes(raw.loadUnaligned(fromByteOffset: b - w - 1, as: UInt64.self))
+                | Self.zeroBytes(raw.loadUnaligned(fromByteOffset: b - w + 1, as: UInt64.self))
+                | Self.zeroBytes(raw.loadUnaligned(fromByteOffset: b + w - 1, as: UInt64.self))
+                | Self.zeroBytes(raw.loadUnaligned(fromByteOffset: b + w + 1, as: UInt64.self))
+            guard around == 0 else { return false }
+            // None of them in flight, nor already done this step.
+            let movedBytes = UnsafeRawPointer(moved).loadUnaligned(fromByteOffset: b, as: UInt64.self)
+            let stampBytes = UnsafeRawPointer(stamp).loadUnaligned(fromByteOffset: b, as: UInt64.self)
+            let now = ones &* UInt64(frame), before = ones &* UInt64(previous)
+            guard Self.zeroBytes(movedBytes ^ now) | Self.zeroBytes(movedBytes ^ before)
+                    | Self.zeroBytes(stampBytes ^ now) == 0 else { return false }
+            (velocities + b).update(repeating: .zero, count: 8)
+            UnsafeMutableRawPointer(stamp).storeBytes(of: now, toByteOffset: b, as: UInt64.self)
+            return true
+        }
+
+        /// The same for the eight cells of column `x` from row `y`: no sand, or eight buried grains at
+        /// rest. A column isn't contiguous in memory, so each row of the block and the rows above and
+        /// below are read as a word of three cells (and one more): ten reads instead of three per cell.
+        @inline(__always)
+        private func settle(column x: Int, from y: Int) -> Bool {
+            let raw = UnsafeRawPointer(kind)
+            let w = width
+            var empty: UInt32 = 0
+            var grains = 0
+            for k in 0..<8 {
+                let word = raw.loadUnaligned(fromByteOffset: (y + k) * w + x - 1, as: UInt32.self)
+                empty |= Self.emptyBits(word)
+                if (word >> 8) & 0xFF == UInt32(SandWorld.grain) { grains += 1 }
+            }
+            if grains == 0 { return true }
+            guard grains == 8, empty == 0 else { return false }
+            empty = Self.emptyBits(raw.loadUnaligned(fromByteOffset: (y - 1) * w + x - 1, as: UInt32.self))
+                | Self.emptyBits(raw.loadUnaligned(fromByteOffset: (y + 8) * w + x - 1, as: UInt32.self))
+            guard empty == 0 else { return false }
+            // None of them in flight, nor already done this step.
+            for k in 0..<8 {
+                let i = (y + k) * w + x
+                if moved[i] == frame || moved[i] == previous || stamp[i] == frame { return false }
+            }
+            for k in 0..<8 {
+                let i = (y + k) * w + x
+                velocities[i] = .zero
+                stamp[i] = frame
+            }
+            return true
+        }
+
+        /// Non-zero if any byte of `v` is zero.
+        @inline(__always)
+        private static func zeroBytes(_ v: UInt64) -> UInt64 {
+            (v &- 0x0101_0101_0101_0101) & ~v & 0x8080_8080_8080_8080
+        }
+
+        /// Notes which rows (or columns) hold any sand as the step starts, so the empty ones can
+        /// be skipped. That's exact: a grain that moves into an empty line during the step has
+        /// already had its turn. Reads the grid a word at a time; empty cells and walls have no
+        /// grain bit.
+        private func markOccupied(rows: Bool) {
+            let raw = UnsafeRawPointer(kind)
+            let w = width, h = height
+            let words = (w + 7) / 8
+            let grainBits: UInt64 = 0x0101_0101_0101_0101
+            if rows {
+                for y in 1..<(h - 1) {
+                    // The last word runs on into the next row, which can only keep a row in.
+                    var any: UInt64 = 0
+                    for k in 0..<words {
+                        any |= raw.loadUnaligned(fromByteOffset: y * w + 8 * k, as: UInt64.self)
+                    }
+                    occupied[y] = any & grainBits != 0 ? 1 : 0
+                }
+            } else {
+                // OR the rows together: byte x % 8 of word x / 8 then stands for column x.
+                columnBits.update(repeating: 0, count: words)
+                for y in 1..<(h - 1) {
+                    for k in 0..<words {
+                        columnBits[k] |= raw.loadUnaligned(fromByteOffset: y * w + 8 * k, as: UInt64.self)
+                    }
+                }
+                for x in 1..<(w - 1) {
+                    occupied[x] = UInt8(truncatingIfNeeded: columnBits[x / 8] >> UInt64(8 * (x % 8))) & 1
+                }
+            }
+        }
+
+        /// Whether all eight neighbours of `i` are taken, by sand or wall. Reads each row of three
+        /// as one little-endian word, in which an empty cell is a zero byte.
+        @inline(__always)
+        private func surrounded(_ i: Int) -> Bool {
+            let raw = UnsafeRawPointer(kind)
+            let above = raw.loadUnaligned(fromByteOffset: i - width - 1, as: UInt32.self)
+            let level = raw.loadUnaligned(fromByteOffset: i - 1, as: UInt32.self)
+            let below = raw.loadUnaligned(fromByteOffset: i + width - 1, as: UInt32.self)
+            return Self.emptyBits(above) | Self.emptyBits(level) | Self.emptyBits(below) == 0
+        }
+
+        /// Non-zero if any of the low three bytes of `v` is zero (the classic zero-byte test, with
+        /// the fourth byte forced on).
+        @inline(__always)
+        private static func emptyBits(_ v: UInt32) -> UInt32 {
+            let x = v | 0xFF00_0000
+            return (x &- 0x0101_0101) & ~x & 0x8080_8080
+        }
+
+        @inline(__always)
+        private mutating func update(_ start: Int) {
+            let w = width
+            // Sand that's been sitting still can only press on what's under it. Letting it "hit"
+            // would turn the speed it gathers between moves into bounces that ripple through a
+            // resting pile.
+            let inFlight = moved[start] == previous || moved[start] == frame
+            // Most of a pile is buried: a grain at rest with all eight neighbours taken can't go
+            // anywhere this step, so skip the work. (A grain still in flight goes the long way, so
+            // its impact can splash the grains it hits.)
+            if !inFlight && surrounded(start) {
+                velocities[start] = .zero
+                stamp[start] = frame
+                return
+            }
+            var vx = velocities[start].x * p.drag
+            var vy = velocities[start].y * p.drag
+            if glassDrag > 0 && (vx != 0 || vy != 0) {
+                let speed = (vx * vx + vy * vy).squareRoot()
+                let k = max(0, speed - glassDrag) / speed
+                vx *= k
+                vy *= k
+            }
+            vx += ax
+            vy += ay
+            if agitation > 0 {
+                vx += rng.signedUnit() * agitation
+                vy += rng.signedUnit() * agitation
+            }
+            let speed2 = vx * vx + vy * vy
+            if speed2 > p.maxSpeed * p.maxSpeed {
+                let k = p.maxSpeed / speed2.squareRoot()
+                vx *= k
+                vy *= k
+            }
+
+            var i = start
+            let absX = abs(vx), absY = abs(vy)
+            let m = max(absX, absY)
+            if m > 0.0001 {
+                // Move m cells this step on average: the whole part always, the fraction by chance.
+                // Each move is one cell along x, y or a diagonal, picked so the expected
+                // displacement matches the velocity — shallow angles don't get rounded away.
+                var steps = Int(m)
+                let fraction = m - Float(steps)
+                if rng.unit() < (inFlight ? fraction : fraction * p.restingProbeBoost) { steps += 1 }
+                let chanceX = absX / m, chanceY = absY / m
+                let stepX = vx < 0 ? -1 : 1
+                let stepY = vy < 0 ? -1 : 1
+                if steps == 0 && p.followsVacancies {
+                    // If the grain ahead just moved off, follow it now rather than whenever the
+                    // dice say so: that way a column or an overhang falls as one piece instead of
+                    // crumbling a layer at a time.
+                    let ahead = i + (absX >= absY ? stepX : stepY * w)
+                    if kind[ahead] == SandWorld.empty && (moved[ahead] == frame || moved[ahead] == previous) {
+                        steps = 1
+                    }
+                }
+                var n = 0
+                while n < steps {
+                    n += 1
+                    let dx = chanceX >= 1 || rng.unit() < chanceX ? stepX : 0
+                    let dy = chanceY >= 1 || rng.unit() < chanceY ? stepY : 0
+                    let target = i + dx + dy * w
+                    if enter(from: i, to: target) {
+                        shift(i, to: target)
+                        i = target
+                        continue
+                    }
+
+                    let headingX = vx, headingY = vy
+                    // A grain blocked by one moving the same way just falls in behind it, the way
+                    // a stream of sand stays a stream; only sand that's (nearly) still deflects it.
+                    let speed2 = vx * vx + vy * vy
+                    let following = speed2 > 0.25 * p.impactSpeed * p.impactSpeed
+                        && kind[target] == SandWorld.grain
+                        && (moved[target] == frame || moved[target] == previous)
+                        && velocities[target].x * vx + velocities[target].y * vy > 0.3 * speed2
+                    let impact = collide(target, dx, dy, inFlight || n > 1, &vx, &vy)
+                    // What a deflected grain carries on with: after a hard landing only what
+                    // survived the impact, otherwise its whole speed, so avalanches keep rolling.
+                    let carried = impact
+                        ? (vx * vx + vy * vy).squareRoot()
+                        : (headingX * headingX + headingY * headingY).squareRoot()
+                    if let (cell, ux, uy, rolled) = deflect(from: i, dx, dy, headingX, headingY,
+                                                             rollOnly: following) {
+                        shift(i, to: cell)
+                        i = cell
+                        if rolled {
+                            // Having climbed over a neighbour, carry on along the top of it.
+                            let speed = carried * (1 - p.slideFriction)
+                            let k: Float = dx != 0 && dy != 0 ? 0.707_106_8 : 1
+                            vx = Float(dx) * k * speed
+                            vy = Float(dy) * k * speed
+                        } else {
+                            // Keep sliding along the new direction, so avalanches pick up speed.
+                            let speed = carried * (1 - p.slideFriction)
+                            vx = ux * speed
+                            vy = uy * speed
+                        }
+                    } else if kind[target] == SandWorld.wall, let cell = slip(from: i, dx, dy, headingX, headingY) {
+                        shift(i, to: cell)
+                        i = cell
+                        vx = 0
+                        vy = 0
+                    } else if !inFlight || vx * vx + vy * vy < p.restSpeed * p.restSpeed {
+                        // Static friction: sand that was sitting still and has nowhere downhill
+                        // enough to go stays put, whatever sideways speed it gathered meanwhile.
+                        vx = 0
+                        vy = 0
+                    }
+                    break
+                }
+            }
+            velocities[i] = SIMD2(vx, vy)
+            stamp[i] = frame
+        }
+
+        /// Whether a grain at `from` may move into `to`, spending a neck token if it has to.
+        @inline(__always)
+        private mutating func enter(from: Int, to: Int) -> Bool {
+            guard kind[to] == SandWorld.empty else { return false }
+            if metersFlow && gate[to] != 0 && gate[from] == 0 {
+                // Straight in, unless no grain is waiting straight above the neck cell. Otherwise
+                // the grains sliding down the glass beside the neck get there first, and the hole
+                // each one leaves climbs up along the glass: the hourglass drains down its sides
+                // instead of opening a crater in the middle. (And without the exception, the last
+                // grains would sit on the ledge beside the neck for ever.)
+                let step = to - from
+                if step != width && step != -width && step != 1 && step != -1 {
+                    let sideways = step > 0 ? (step == width + 1 ? 1 : -1) : (step == -width + 1 ? 1 : -1)
+                    let straightAbove = to - (step - sideways)
+                    if kind[straightAbove] == SandWorld.grain { return false }
+                }
+                guard gateTokens >= 1 else { return false }
+                gateTokens -= 1
+            }
+            return true
+        }
+
+        /// Velocity response to being blocked moving by (dx, dy). Only a grain that's `moving` can
+        /// bounce or splash; otherwise the contact just stops it closing in.
+        /// Returns whether it was an impact rather than a resting contact.
+        @inline(__always)
+        private mutating func collide(_ target: Int, _ dx: Int, _ dy: Int, _ moving: Bool,
+                                      _ vx: inout Float, _ vy: inout Float) -> Bool {
+            var nx = Float(dx), ny = Float(dy)
+            if dx != 0 && dy != 0 {
+                nx *= 0.707_106_8
+                ny *= 0.707_106_8
+            }
+            let vn = vx * nx + vy * ny
+            // Work relative to what was hit: a wall is still, a grain may be moving too.
+            let isGrain = kind[target] == SandWorld.grain
+            let other = isGrain ? velocities[target].x * nx + velocities[target].y * ny : 0
+            let closing = vn - other
+            guard closing > 0 else { return false }
+            if closing <= p.impactSpeed || !moving {
+                // Resting contact: just stop closing in.
+                vx -= closing * nx
+                vy -= closing * ny
+                return false
+            }
+            let bounce: Float
+            if isGrain {
+                bounce = p.grainBounce
+                let kick = closing * p.splash
+                velocities[target].x += kick * nx
+                velocities[target].y += kick * ny
+            } else {
+                bounce = p.wallBounce
+                if kind[target] == SandWorld.wall { impact += closing - p.impactSpeed }
+            }
+            let keep = 1 - p.friction
+            let tx = vx - vn * nx, ty = vy - vn * ny
+            let normal = other - bounce * closing
+            vx = tx * keep + normal * nx
+            vy = ty * keep + normal * ny
+            return true
+        }
+
+        /// After being blocked moving by (dx, dy), tries the two neighbouring directions 45° either
+        /// side, most downhill first, as long as they're within the slide angle of the heading.
+        /// Returns the cell moved into, the unit direction of the move, and whether it was a
+        /// roll-over.
+        @inline(__always)
+        private mutating func deflect(from i: Int, _ dx: Int, _ dy: Int, _ hx: Float, _ hy: Float,
+                                      rollOnly: Bool) -> (Int, Float, Float, Bool)?
+        {
+            let speed = (hx * hx + hy * hy).squareRoot()
+            guard speed > 0.0001 else { return nil }
+            let ux = hx / speed, uy = hy / speed
+
+            let ax, ay, bx, by: Int
+            if dx != 0 && dy != 0 {
+                (ax, ay, bx, by) = (dx, 0, 0, dy)
+            } else if dx != 0 {
+                (ax, ay, bx, by) = (dx, 1, dx, -1)
+            } else {
+                (ax, ay, bx, by) = (1, dy, -1, dy)
+            }
+            let sa: Float = ax != 0 && ay != 0 ? 0.707_106_8 : 1
+            let sb: Float = bx != 0 && by != 0 ? 0.707_106_8 : 1
+            let da = (Float(ax) * ux + Float(ay) * uy) * sa
+            let db = (Float(bx) * ux + Float(by) * uy) * sb
+
+            let aFirst = abs(da - db) < 0.04 ? rng.coinFlip() : da > db
+            let slide = p.slideCosine
+            // After a straight-on block, the less downhill diagonal climbs over what's in the way.
+            let roll = (dx == 0 || dy == 0) && kind[i + dx + dy * width] == SandWorld.grain
+                ? p.rollCosine : slide
+            if rollOnly && roll >= slide { return nil }
+            for pass in 0..<2 {
+                let useA = (pass == 0) == aFirst
+                let d = useA ? da : db
+                guard d >= (pass == 0 ? slide : min(slide, roll)) else { continue }
+                // Behind a moving grain, only climbing over it is allowed: that thickens a flowing
+                // layer, while sliding aside would scatter a falling stream.
+                if rollOnly && d >= slide { continue }
+                let cx = useA ? ax : bx, cy = useA ? ay : by
+                let cell = i + cx + cy * width
+                // A grain only rolls over a neighbour if it can carry on along the top of it;
+                // otherwise rolling would slowly steepen slopes that are already stable.
+                if d < slide && kind[cell + dx + dy * width] != SandWorld.empty { continue }
+                if enter(from: i, to: cell) {
+                    let s = useA ? sa : sb
+                    return (cell, Float(cx) * s, Float(cy) * s, d < slide)
+                }
+            }
+            return nil
+        }
+
+        /// Glass is slicker than sand. A grain sitting on a ledge of the glass staircase (blocked
+        /// straight ahead by wall, with no open diagonal) may step sideways if the glass falls away
+        /// just beyond; sand-on-sand never does this, so piles keep their slopes, and a level floor
+        /// never qualifies. Without it a thin skin of sand clings to shallow glass for ever, and an
+        /// hourglass never quite runs out.
+        @inline(__always)
+        private mutating func slip(from i: Int, _ dx: Int, _ dy: Int, _ hx: Float, _ hy: Float) -> Int? {
+            guard dx == 0 || dy == 0 else { return nil }
+            let ahead = dx + dy * width
+            let side = dx == 0 ? 1 : width
+            // Try the side gravity leans towards first.
+            let lean = dx == 0 ? hx : hy
+            let first = lean > 0 || (lean == 0 && rng.coinFlip()) ? side : -side
+            if let cell = slip(from: i, by: first, ahead: ahead) { return cell }
+            return slip(from: i, by: -first, ahead: ahead)
+        }
+
+        /// One side of `slip`: a step of `d` onto glass that falls away beyond it.
+        @inline(__always)
+        private mutating func slip(from i: Int, by d: Int, ahead: Int) -> Int? {
             let next = i + d
-            guard kind[next] == Self.empty, kind[next + ahead] == Self.wall,
-                  kind[next + d + ahead] == Self.empty else { continue }
-            if enter(from: i, to: next) { return next }
+            guard kind[next] == SandWorld.empty, kind[next + ahead] == SandWorld.wall,
+                  kind[next + d + ahead] == SandWorld.empty else { return nil }
+            return enter(from: i, to: next) ? next : nil
         }
-        return nil
+
+        /// Moves a grain's contents (not its velocity, which `update` writes at the end) to an
+        /// empty cell.
+        @inline(__always)
+        private mutating func shift(_ from: Int, to: Int) {
+            kind[to] = SandWorld.grain
+            kind[from] = SandWorld.empty
+            color[to] = color[from]
+            grainFlags[to] = grainFlags[from]
+            moved[to] = frame
+            // On an empty cell, `moved` records when it was vacated (see the follow rule in `update`).
+            moved[from] = frame
+            moves += 1
+        }
     }
 
-    /// Moves a grain's contents (not its velocity, which `update` writes at the end) to an empty cell.
-    @inline(__always)
-    private func shift(_ from: Int, to: Int) {
+    /// Moves a whole grain, velocity included, to an empty cell.
+    private func relocate(_ from: Int, to: Int) {
         kind[to] = Self.grain
         kind[from] = Self.empty
         color[to] = color[from]
         grainFlags[to] = grainFlags[from]
         moved[to] = frame
-        // On an empty cell, `moved` records when it was vacated (see the follow rule in `update`).
         moved[from] = frame
         lastMoves += 1
-    }
-
-    /// Moves a whole grain, velocity included, to an empty cell.
-    private func relocate(_ from: Int, to: Int) {
-        shift(from, to: to)
-        velocityX[to] = velocityX[from]
-        velocityY[to] = velocityY[from]
+        velocities[to] = velocities[from]
         stamp[to] = stamp[from]
-        velocityX[from] = 0
-        velocityY[from] = 0
+        velocities[from] = .zero
     }
 
     // MARK: - Adding and removing sand
@@ -524,8 +766,7 @@ public final class SandWorld {
         kind[index] = Self.grain
         color[index] = c
         grainFlags[index] = flags
-        velocityX[index] = vx
-        velocityY[index] = vy
+        velocities[index] = SIMD2(vx, vy)
         moved[index] = frame
         grainCount += 1
         return true
@@ -535,8 +776,7 @@ public final class SandWorld {
     public func removeGrain(at index: Int) -> Bool {
         guard index >= 0, index < cellCount, kind[index] == Self.grain else { return false }
         kind[index] = Self.empty
-        velocityX[index] = 0
-        velocityY[index] = 0
+        velocities[index] = .zero
         grainCount -= 1
         return true
     }
@@ -650,8 +890,8 @@ public final class SandWorld {
         forEachGrain(nearX: x, y: y, radius: radius) { i, dx, dy, distance in
             let falloff = 1 - distance / radius
             let k = strength * falloff * falloff / max(distance, 0.5)
-            velocityX[i] += dx * k + rng.signedUnit() * strength * 0.15
-            velocityY[i] += dy * k + rng.signedUnit() * strength * 0.15
+            velocities[i].x += dx * k + rng.signedUnit() * strength * 0.15
+            velocities[i].y += dy * k + rng.signedUnit() * strength * 0.15
         }
     }
 
@@ -696,8 +936,8 @@ public final class SandWorld {
             relocate(grain.index, to: cell)
             let dx = Float(cell % width) + 0.5 - x, dy = Float(cell / width) + 0.5 - y
             let d = max((dx * dx + dy * dy).squareRoot(), 0.01)
-            velocityX[cell] = dx / d * 0.5 + fvx * 0.5
-            velocityY[cell] = dy / d * 0.5 + fvy * 0.5
+            velocities[cell].x = dx / d * 0.5 + fvx * 0.5
+            velocities[cell].y = dy / d * 0.5 + fvy * 0.5
         }
     }
 
@@ -728,26 +968,43 @@ public final class SandWorld {
             swap(&color[a], &color[b])
             swap(&grainFlags[a], &grainFlags[b])
             swap(&moved[a], &moved[b])
-            let (ax, ay) = (velocityX[a], velocityY[a])
-            velocityX[a] = -velocityX[b]
-            velocityY[a] = -velocityY[b]
-            velocityX[b] = -ax
-            velocityY[b] = -ay
+            let va = velocities[a]
+            velocities[a] = Self.reversed(velocities[b])
+            velocities[b] = Self.reversed(va)
             a += 1
             b -= 1
         }
         if a == b {
-            velocityX[a] = -velocityX[a]
-            velocityY[a] = -velocityY[a]
+            velocities[a] = Self.reversed(velocities[a])
         }
+    }
+
+    /// `v` the other way round. (Not `-v`: SIMD negation is `0 - v`, which turns a still grain's
+    /// zero velocity into +0 rather than -0. That doesn't move a grain any differently, but it's
+    /// kept exactly as it was.)
+    @inline(__always)
+    private static func reversed(_ v: SIMD2<Float>) -> SIMD2<Float> {
+        SIMD2(-v.x, -v.y)
     }
 
     /// Grains in rows `rows` (clamped to the grid).
     public func grainCount(inRows rows: Range<Int>) -> Int {
         let lo = max(0, rows.lowerBound), hi = min(height, rows.upperBound)
         guard lo < hi else { return 0 }
+        // A running hourglass counts its bulbs every frame. Grains are the only cells with their
+        // lowest bit set, so eight cells' worth can be counted at once.
+        let raw = UnsafeRawPointer(kind)
+        var i = lo * width
+        let end = hi * width
         var count = 0
-        for i in (lo * width)..<(hi * width) where kind[i] == Self.grain { count += 1 }
+        while i + 8 <= end {
+            count += (raw.loadUnaligned(fromByteOffset: i, as: UInt64.self) & 0x0101_0101_0101_0101).nonzeroBitCount
+            i += 8
+        }
+        while i < end {
+            if kind[i] == Self.grain { count += 1 }
+            i += 1
+        }
         return count
     }
 
@@ -758,51 +1015,55 @@ public final class SandWorld {
                 grainCount(inRows: (neck.upperBound + 1)..<height))
     }
 
-    /// Moves up to `count` grains straight from the surface of the upper bulb to the surface of
-    /// the lower one, for catching up on time that passed while the screen was off.
-    /// `downward` says which way the sand is flowing in screen terms.
+    /// Moves up to `count` grains straight from the upper bulb to the lower one, for catching up on
+    /// time that passed while the screen was off or dimmed. `downward` says which way the sand is
+    /// flowing in screen terms.
+    ///
+    /// They leave from a crater over the neck and arrive in a cone beneath it, both with sides at
+    /// about the angle of repose, the way a real hourglass drains and fills; so whenever the sand
+    /// is looked at again it's already in the shape the running hourglass would have given it.
     @discardableResult
     public func transferThroughNeck(_ count: Int, downward: Bool) -> Int {
         guard let neck = neckRows, count > 0 else { return 0 }
         let upper = 0..<neck.lowerBound, lower = (neck.upperBound + 1)..<height
-        let sourceRows = downward ? Array(upper) : Array(lower.reversed())
-        let targetRows = downward ? Array(lower.reversed()) : Array(upper)
-        var room = 0
-        for y in targetRows {
-            for x in 0..<width where kind[y * width + x] == Self.empty { room += 1 }
-        }
-        let count = min(count, room)
-        guard count > 0 else { return 0 }
+        let (source, target) = downward ? (upper, lower) : (lower, upper)
+        let centre = Float(width) / 2
+        /// How far along the flow row `y` is.
+        func depth(_ y: Int) -> Float { Float(downward ? y : height - 1 - y) }
+        /// Sideways distance from the middle of the neck, in rows of slope: tan 34°.
+        func aside(_ x: Int) -> Float { 0.67 * abs(Float(x) + 0.5 - centre) }
 
-        // Take from the upper bulb, starting at its free surface.
-        var taken: [(UInt32, UInt8)] = []
-        outer: for y in sourceRows {
-            for x in 0..<width {
-                let i = y * width + x
-                if kind[i] == Self.grain {
-                    taken.append((color[i], grainFlags[i]))
-                    removeGrain(at: i)
-                    if taken.count == count { break outer }
-                }
+        // Grains go in order of how far they are into the crater. Every grain lies further in than
+        // the one above it, so each column is taken from its surface down; a little noise breaks
+        // the ties between left and right.
+        var leaving: [(key: Float, cell: Int)] = []
+        for y in source {
+            for x in 0..<width where kind[y * width + x] == Self.grain {
+                leaving.append((depth(y) + aside(x) + rng.unit() * 0.01, y * width + x))
             }
         }
-        // Settle them onto the lower bulb, from its far end.
-        var next = 0
-        outer2: for y in targetRows {
-            for x in 0..<width where next < taken.count {
-                let i = y * width + x
-                if kind[i] == Self.empty {
-                    addGrain(at: i, color: taken[next].0, flags: taken[next].1)
-                    next += 1
-                }
+        // And arrive in order of how far down the cone a cell is: each column fills from the bottom.
+        var arriving: [(key: Float, cell: Int)] = []
+        for y in target {
+            for x in 0..<width where kind[y * width + x] == Self.empty {
+                arriving.append((aside(x) - depth(y) + rng.unit() * 0.01, y * width + x))
             }
-            if next == taken.count { break outer2 }
         }
-        return next
+        let moving = min(count, leaving.count, arriving.count)
+        guard moving > 0 else { return 0 }
+        leaving.sort { $0.key < $1.key }
+        arriving.sort { $0.key < $1.key }
+        for k in 0..<moving {
+            let from = leaving[k].cell
+            let (c, flags) = (color[from], grainFlags[from])
+            removeGrain(at: from)
+            addGrain(at: arriving[k].cell, color: c, flags: flags)
+        }
+        return moving
     }
 
     /// The stored velocity of the grain at `index`.
     public func velocity(at index: Int) -> (x: Float, y: Float) {
-        (velocityX[index], velocityY[index])
+        (velocities[index].x, velocities[index].y)
     }
 }

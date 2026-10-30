@@ -9,6 +9,9 @@ import UniformTypeIdentifiers
 //
 //   swift run -c release sandpreview [scene] [--out dir] [--palette id] [--grain px]
 //   scenes: pour, tilt, shake, hourglass, carve, palettes, bench, all (default)
+//
+//   swift run -c release sandpreview bench [--case name] [--grain px] [--repeats n]
+//   times the simulation and renderer; without --grain, at every grain size.
 
 struct Options {
     var scene = "all"
@@ -16,6 +19,10 @@ struct Options {
     var palette = SandPalette.sahara
     /// Pixels per grain on a 46 mm Series 11 (416 × 496 px).
     var grain = 3
+    var grainGiven = false
+    /// Benchmark only: the one case to time, and how many times to time each.
+    var benchCase: String?
+    var repeats = 7
 }
 
 var options = Options()
@@ -24,7 +31,9 @@ while let arg = args.popFirst() {
     switch arg {
     case "--out": options.out = URL(fileURLWithPath: args.popFirst() ?? "preview", isDirectory: true)
     case "--palette": options.palette = SandPalette.named(args.popFirst() ?? "")
-    case "--grain": options.grain = Int(args.popFirst() ?? "") ?? 3
+    case "--grain": options.grain = Int(args.popFirst() ?? "") ?? 3; options.grainGiven = true
+    case "--case": options.benchCase = args.popFirst()
+    case "--repeats": options.repeats = Int(args.popFirst() ?? "") ?? 7
     default: options.scene = arg
     }
 }
@@ -332,6 +341,13 @@ func hourglassScene() {
     }
     scene.save("hourglass-3-later")
     scene.saveGIF("hourglass")
+    // Turned over again and left with the screen off: catching up moves the sand in one go.
+    scene.world.rotateHalfTurn()
+    scene.run(40)
+    scene.world.transferThroughNeck(scene.world.grainCount * 2 / 5, downward: true)
+    scene.save("hourglass-4-caught-up")
+    scene.run(30)
+    scene.save("hourglass-5-caught-up-and-running")
     let counts = scene.world.bulbCounts()!
     print("hourglass: above \(counts.above), below \(counts.below), capacity \(capacity)")
 }
@@ -457,30 +473,98 @@ func paletteScene() {
     }
 }
 
+/// Times the simulation and the renderer in the situations the app spends its time in, at each
+/// grain size. Every case is scripted from fixed seeds, so runs are comparable from build to build.
 func bench() {
-    for grain in [2, 3, 4] {
+    struct Case {
+        var name: String
+        var frames: Int
+        /// Builds the scene to be timed (untimed).
+        var setup: (Int) -> Scene
+        /// Simulates frame `n`.
+        var frame: (Scene, Int) -> Void
+    }
+    func settled(_ grain: Int) -> Scene {
         let scene = Scene(shape: .screen, palette: .sahara, grain: grain)
         let target = fillFraction(scene, 0.4)
         scene.run(150, pour: target / 150)
         scene.run(100)
-        let steps = 600 // frames, really
-        let start = Date()
-        // Keep the sand busy: slosh it around.
-        for s in 0..<steps {
-            let degrees = Float(s) * 0.9
-            scene.run(1, degrees: degrees, strength: 0.9)
+        return scene
+    }
+    let cases = [
+        // Sand sloshing round as the wrist turns: lots of grains in flight.
+        Case(name: "slosh", frames: 600, setup: settled) { scene, n in
+            scene.run(1, degrees: Float(n) * 0.9, strength: 0.9)
+        },
+        // Looking at the watch: the wrist sways a few degrees, so the sand stays awake, but
+        // nearly all of it is resting.
+        Case(name: "held", frames: 600, setup: settled) { scene, n in
+            scene.run(1, degrees: 4 * sinf(Float(n) * 0.05), strength: 0.8)
+        },
+        // The same with the watch on its side: gravity across the screen.
+        Case(name: "sideways", frames: 600, setup: { grain in
+            let scene = settled(grain)
+            scene.run(200, degrees: 90, strength: 0.8)
+            return scene
+        }) { scene, n in
+            scene.run(1, degrees: 90 + 4 * sinf(Float(n) * 0.05), strength: 0.8)
+        },
+        // The opening pour.
+        Case(name: "pour", frames: 150, setup: { Scene(shape: .screen, palette: .sahara, grain: $0) }) { scene, _ in
+            scene.run(1, pour: fillFraction(scene, 0.4) / 150)
+        },
+        // A one-minute hourglass running, turned over a moment before.
+        Case(name: "hourglass", frames: 600, setup: { grain in
+            let scene = Scene(shape: .hourglass, palette: .sahara, grain: grain)
+            let rows = scene.world.neckRows!
+            scene.world.fill(Int(Double(scene.container.bulbCapacity()) * 0.82),
+                             rows: (rows.upperBound + 1)..<scene.world.height) { rng, _ in
+                scene.palette.makeGrain(&rng)
+            }
+            scene.run(30)
+            scene.world.rotateHalfTurn()
+            scene.world.metersFlow = true
+            scene.run(60)
+            return scene
+        }) { scene, _ in
+            // All the sand through in 60 s, and the time left counted every frame, as the app does.
+            scene.world.addGateTokens(Float(scene.world.grainCount) / 60 / 60)
+            scene.run(1)
+            _ = scene.world.bulbCounts()
+        },
+    ]
+    let repeats = options.repeats
+    func milliseconds(_ body: () -> Void) -> Double {
+        let start = DispatchTime.now().uptimeNanoseconds
+        body()
+        return Double(DispatchTime.now().uptimeNanoseconds - start) / 1e6
+    }
+    print("ms per frame (\(SandWorld.stepsPerFrame) steps), best of \(repeats) runs")
+    for grain in options.grainGiven ? [options.grain] : [2, 3, 4] {
+        for c in cases where options.benchCase.map({ $0 == c.name }) ?? true {
+            var simulate: [Double] = [], render: [Double] = [], image: [Double] = []
+            var grains = 0, size = ""
+            for _ in 0..<repeats {
+                let scene = c.setup(grain)
+                var sim = 0.0, draw = 0.0, wrap = 0.0
+                for n in 0..<c.frames {
+                    sim += milliseconds { c.frame(scene, n) }
+                    draw += milliseconds {
+                        scene.renderer.render(scene.world, gravityX: scene.gravity.0, gravityY: scene.gravity.1,
+                                              sparkle: scene.palette.packedSparkle)
+                    }
+                    wrap += milliseconds { _ = scene.renderer.makeImage() }
+                }
+                simulate.append(sim / Double(c.frames))
+                render.append(draw / Double(c.frames))
+                image.append(wrap / Double(c.frames))
+                grains = scene.world.grainCount
+                size = "\(scene.world.width)x\(scene.world.height)"
+            }
+            let name = c.name.padding(toLength: 9, withPad: " ", startingAt: 0)
+            print(String(format: "grain %dpx %@ %@, %5d grains: simulate %.3f  render %.3f  image %.3f",
+                         grain, name, size, grains, simulate.min()!, render.min()!, image.min()!))
         }
-        let elapsed = Date().timeIntervalSince(start)
-        let renderStart = Date()
-        for _ in 0..<steps {
-            scene.renderer.render(scene.world, gravityX: 0, gravityY: 1, sparkle: 0xFFFF_FFFF)
-            _ = scene.renderer.makeImage()
-        }
-        let renderElapsed = Date().timeIntervalSince(renderStart)
-        print(String(format: "grain %dpx: %dx%d, %d grains: %.3f ms/frame (%d steps), %.3f ms/render",
-                     grain, scene.world.width, scene.world.height, scene.world.grainCount,
-                     elapsed / Double(steps) * 1000, SandWorld.stepsPerFrame,
-                     renderElapsed / Double(steps) * 1000))
     }
 }
 
@@ -491,7 +575,8 @@ let scenes: [String: () -> Void] = [
 if options.scene == "bench" {
     bench()
 } else {
-    for name in options.scene == "all" ? scenes.keys.sorted().filter { $0 != "icon" } : [options.scene] {
+    let names = options.scene == "all" ? scenes.keys.sorted().filter { $0 != "icon" } : [options.scene]
+    for name in names {
         guard let scene = scenes[name] else { print("unknown scene \(name)"); exit(1) }
         scene()
         if name == "icon" { stills.removeAll() } else { writeSheet("\(name)-sheet", columns: name == "palettes" ? 5 : 4) }

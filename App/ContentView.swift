@@ -22,11 +22,12 @@ struct ContentView: View {
 
     private var mode: SandMode { SandMode(rawValue: modeID) ?? .sandbox }
     private var palette: SandPalette { SandPalette.named(paletteID) }
+    private var grain: GrainSize { GrainSize(rawValue: grainID) ?? .medium }
 
     var body: some View {
         NavigationStack {
-            SandScreen(controller: controller, palette: palette, mode: mode, flipAngle: flipAngle,
-                       badge: badge)
+            SandScreen(controller: controller, palette: palette, mode: mode, grain: grain,
+                       flipAngle: flipAngle, badge: badge)
                 .ignoresSafeArea()
                 .focusable()
                 .focusEffectDisabled()
@@ -95,7 +96,7 @@ struct ContentView: View {
 
     private func apply() {
         controller.mode = mode
-        controller.grain = GrainSize(rawValue: grainID) ?? .medium
+        controller.grain = grain
         controller.setPalette(palette)
         controller.haptics.isEnabled = hapticsOn
         controller.fill = fill
@@ -106,7 +107,7 @@ struct ContentView: View {
         if phase == .active && !dimmed {
             controller.resume(at: .now)
         } else {
-            controller.suspend(at: .now)
+            controller.suspend(at: .now, showing: dimmed)
         }
     }
 

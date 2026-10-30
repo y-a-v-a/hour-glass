@@ -9,6 +9,8 @@ import WatchKit
 final class MotionReader {
     private let manager = CMMotionManager()
     private var demoStart = Date()
+    /// The last real reading, for the moments before a restarted sensor delivers a new one.
+    private var lastSample: MotionSample?
 
     /// Whether real motion data is available. It isn't in the simulator.
     var isAvailable: Bool { manager.isDeviceMotionAvailable }
@@ -17,9 +19,21 @@ final class MotionReader {
     /// simulator shows the sand moving.
     let demo = ProcessInfo.processInfo.arguments.contains("-demo")
 
+    /// Readings a second while the sand is moving, and while it sleeps and is only checked now and
+    /// then for the wrist moving.
+    private static let awakeRate = 60.0, asleepRate = 10.0
+
+    /// While the sand sleeps the sensor needn't run at full rate.
+    var isIdle = false {
+        didSet {
+            guard isIdle != oldValue else { return }
+            manager.deviceMotionUpdateInterval = 1 / (isIdle ? Self.asleepRate : Self.awakeRate)
+        }
+    }
+
     func start() {
         guard isAvailable, !manager.isDeviceMotionActive else { return }
-        manager.deviceMotionUpdateInterval = 1.0 / 60
+        manager.deviceMotionUpdateInterval = 1 / (isIdle ? Self.asleepRate : Self.awakeRate)
         manager.startDeviceMotionUpdates()
         demoStart = Date()
     }
@@ -31,11 +45,22 @@ final class MotionReader {
     /// The latest reading, or a stand-in when there's no motion hardware.
     func sample(at date: Date) -> MotionSample {
         if let motion = manager.deviceMotion {
-            return MotionSample(
+            let sample = MotionSample(
                 gravityX: Float(motion.gravity.x), gravityY: Float(motion.gravity.y),
                 gravityZ: Float(motion.gravity.z),
                 userX: Float(motion.userAcceleration.x), userY: Float(motion.userAcceleration.y),
                 userZ: Float(motion.userAcceleration.z))
+            lastSample = sample
+            return sample
+        }
+        if isAvailable {
+            // Updates restart every time the wrist comes up, and the first reading takes a moment.
+            // Until it comes, the watch is where it was last seen, held still: better than a guess
+            // at a pose, which would pull the sand one way and then the other on every raise. The
+            // very first time, flat on its back, which moves nothing.
+            var still = lastSample ?? MotionSample(gravityX: 0, gravityY: 0, gravityZ: -1)
+            (still.userX, still.userY, still.userZ) = (0, 0, 0)
+            return still
         }
         guard demo else {
             // Held up in front of you, tipped back a little, like a raised wrist.
